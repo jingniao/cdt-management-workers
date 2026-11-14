@@ -2964,12 +2964,9 @@ export async function reconcileGroup(
 // Group lifecycle: bootstrap / dissolve
 // ---------------------------------------------------------------------------
 
-// SIMPLIFIED: the Python engine holds a threading.Lock so reconcile and
-// manual operations never overlap. Workers has no cross-isolate lock; the
-// module-level `reconciling` flag in reconcileAll only guards within one
-// isolate. D1-backed idempotency (run.event_id reuse, dedupe flags, "only
-// issue start/stop after a fresh read") keeps a rare overlap safe, but it
-// is not a hard exclusion.
+// All public mutations and scheduled rounds run through the same ControlPlane
+// Durable Object. This local flag only guards accidental internal re-entry;
+// the cross-request exclusion is the coordinator's awaited promise chain.
 let reconciling = false;
 
 export async function bootstrapGroup(
@@ -3571,9 +3568,7 @@ async function confirmPendingManualEvents(env: Env): Promise<void> {
 // ---------------------------------------------------------------------------
 
 export async function reconcileAll(env: Env): Promise<void> {
-  // SIMPLIFIED: in-process guard only (see note above bootstrapGroup).
-  // A second call in the same isolate is skipped; overlapping calls in
-  // another isolate are made safe by the D1-backed idempotency below.
+  // Secondary re-entry guard; ControlPlane serializes external callers.
   if (reconciling) return;
   reconciling = true;
   try {

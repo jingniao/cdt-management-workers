@@ -531,6 +531,24 @@ export async function getInstance(env: Env, account: AliyunAccount): Promise<Ins
 // Stock-out error codes on start (aliyun.py: _NO_STOCK_HINTS, lines ~520-524).
 const NO_STOCK_HINTS = ["InsufficientInventory", "NoStock"];
 
+/** Bulk ECS APIs can return HTTP 200 while the requested instance failed. */
+async function instanceAction(account: AliyunAccount, params: Record<string, string>): Promise<void> {
+  const body = await rpcCall<{
+    InstanceResponses?: { InstanceResponse?: { InstanceId?: string; Code?: string; Message?: string }[] };
+  }>(ecsDomain(account.region_id), account, params);
+  const rows = body?.InstanceResponses?.InstanceResponse;
+  const matches = Array.isArray(rows) ? rows.filter(row => row?.InstanceId === account.instance_id) : [];
+  if (matches.length !== 1 || !matches[0]?.Code) {
+    throw new AliyunError("ECS 未返回目标实例的唯一执行结果，不能确认指令成功");
+  }
+  const result = matches[0];
+  if (result.Code !== "200" && result.Code !== "Success") {
+    const error = new AliyunError(`${result.Code}：${result.Message || "实例操作失败"}`);
+    (error as AliyunError & { code: string }).code = String(result.Code);
+    throw error;
+  }
+}
+
 export async function startInstance(env: Env, account: AliyunAccount): Promise<void> {
   if (isDryRun(env)) {
     const state = mockState(env, account);
@@ -554,7 +572,7 @@ export async function startInstance(env: Env, account: AliyunAccount): Promise<v
     // SINGULAR `InstanceId`, not `InstanceIds`. Both `InstanceIds.1` and
     // a JSON-array `InstanceIds` are rejected with MissingParameter
     // "InstanceId ... is not supplied" (verified live 2026-11-12).
-    await rpcCall(ecsDomain(account.region_id), account, {
+    await instanceAction(account, {
       Action: "StartInstances",
       Version: ECS_VERSION,
       RegionId: account.region_id,
@@ -581,6 +599,10 @@ export async function stopInstance(
   mode = "StopCharging",
   fallback = false,
 ): Promise<string> {
+  if (!["Stop", "KeepCharging", "StopCharging"].includes(mode)) {
+    throw new AliyunError("不支持的停机模式");
+  }
+  const apiMode = mode === "Stop" ? "KeepCharging" : mode;
   if (isDryRun(env)) {
     const state = mockState(env, account);
     const delay = mockOpDelay(env);
@@ -604,15 +626,16 @@ export async function stopInstance(
     // Same as StartInstances: the SDK uses singular `InstanceId.N`
     // (see above); `InstanceIds.1` / JSON array are rejected.
     "InstanceId.1": account.instance_id,
-    StoppedMode: mode,
+    StoppedMode: apiMode,
   };
   try {
-    await rpcCall(ecsDomain(account.region_id), account, params);
+    await instanceAction(account, params);
     return mode;
   } catch (exc) {
-    if (fallback && mode !== "Stop") {
+    // Never turn permission/network/unknown errors into a billable fallback.
+    if (fallback && mode === "StopCharging" && /StoppedMode|NotSupported|NotSupport/.test(errorCode(exc))) {
       try {
-        await rpcCall(ecsDomain(account.region_id), account, { ...params, StoppedMode: "Stop" });
+        await instanceAction(account, { ...params, StoppedMode: "KeepCharging" });
         return "Stop";
       } catch (retryExc) {
         throw new AliyunError(`停止实例失败：${briefError(retryExc)}`);

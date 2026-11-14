@@ -51,6 +51,7 @@ export const SENSITIVE_SETTINGS: ReadonlySet<string> = new Set([
   "ddns_cf_key",
   "notify_tg_token",
   "notify_mail_password",
+  "notify_mail_api_key",
   "notify_wh_headers",
 ]);
 
@@ -127,6 +128,25 @@ export async function setSettings(
     });
   }
   if (statements.length > 0) await batch(env.DB, statements);
+}
+
+/** A unique claim and credentials commit together; a racing setup rolls back. */
+export async function initializeAdmin(env: Env, username: string, passwordHash: string): Promise<boolean> {
+  if ((await getSetting(env, "initialized")) === "1") return false;
+  const encrypted = await encrypt(passwordHash, env.ENCRYPTION_KEY);
+  try {
+    await batch(env.DB, [
+      { sql: "INSERT INTO settings(key,value) VALUES('admin_setup_claimed','1')" },
+      ...Object.entries({ admin_username: username, admin_password: encrypted, initialized: "1" }).map(([key, value]) => ({
+        sql: "INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        params: [key, value],
+      })),
+    ]);
+    return true;
+  } catch (error) {
+    if ((await getSetting(env, "initialized")) === "1") return false;
+    throw error;
+  }
 }
 
 // ---------------------------------------------------------------------------

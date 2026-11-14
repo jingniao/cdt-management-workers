@@ -79,6 +79,15 @@ function timingSafeEqual(a: Uint8Array, b: Uint8Array): boolean {
   return diff === 0;
 }
 
+/** Used only to prove deployment ownership during initial administrator setup. */
+export async function verifySetupKey(value: string, expected: string): Promise<boolean> {
+  if (!value || !expected) return false;
+  const digest = async (text: string) => new Uint8Array(
+    await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text)),
+  );
+  return timingSafeEqual(await digest(value), await digest(expected));
+}
+
 function randomBytes(length: number): Uint8Array {
   const bytes = new Uint8Array(length);
   crypto.getRandomValues(bytes);

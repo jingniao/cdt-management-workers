@@ -48,6 +48,7 @@ export default function SettingsDrawer({ settings, onClose, onSaved }: Props) {
     }
     // 1.2.6 及以前没有这个字段，补 0 让输入框保持受控
     if (!draft.reconcile_offset) draft.reconcile_offset = '0'
+    if (!draft.email.webhook_url) draft.email.webhook_url = ''
     return draft
   })
   const [error, setError] = useState('')
@@ -104,11 +105,8 @@ export default function SettingsDrawer({ settings, onClose, onSaved }: Props) {
         },
         email: {
           enabled: form.email.enabled,
-          host: form.email.host,
-          port: form.email.port,
-          security: form.email.security,
-          username: form.email.username,
-          password: (form.email as unknown as { password?: string }).password || '',
+          webhook_url: form.email.webhook_url,
+          api_key: form.email.api_key || '',
           to: form.email.to,
         },
         webhook: {
@@ -138,7 +136,7 @@ export default function SettingsDrawer({ settings, onClose, onSaved }: Props) {
       const result = await post<{ ok: boolean; detail: string; status?: string }>(
         `/api/v1/settings/test/${channel}`,
         form,
-        // 测试连接要真连 Cloudflare / Telegram / SMTP，DNS 那边还会逐条查记录
+        // 测试连接会请求 Cloudflare / Telegram / 邮件转发接口
         SLOW_TIMEOUT_MS,
       )
       // DDNS 后端返回的 status 已带 emoji（如「✅ 连接正常」「❌ DDNS 异常」），
@@ -159,7 +157,6 @@ export default function SettingsDrawer({ settings, onClose, onSaved }: Props) {
   const tgToken = (form.telegram as unknown as { token?: string }).token || ''
   const cfToken = (form.ddns as unknown as { cf_token?: string }).cf_token || ''
   const cfKey = (form.ddns as unknown as { cf_key?: string }).cf_key || ''
-  const mailPassword = (form.email as unknown as { password?: string }).password || ''
 
   return (
     <>
@@ -587,54 +584,37 @@ export default function SettingsDrawer({ settings, onClose, onSaved }: Props) {
                   <hr style={{ border: 0, borderTop: '1px solid var(--line)', margin: '6px 0' }} />
 
                   <div className="section-head" style={{ marginBottom: 2 }}>
-                    <h2>邮件（SMTP）</h2>
+                    <h2>邮件通知</h2>
                   </div>
                   <Switch
                     label="启用邮件通知"
                     checked={form.email.enabled}
                     onChange={(value) => patch((draft) => (draft.email.enabled = value))}
                   />
-                  <div className="grid-2">
-                    <div className="field">
-                      <label htmlFor="mailhost">SMTP 主机</label>
-                      <input
-                        id="mailhost"
-                        className="input"
-                        value={form.email.host}
-                        onChange={(event) =>
-                          patch((draft) => (draft.email.host = event.target.value))
-                        }
-                        placeholder="smtp.example.com"
-                      />
-                    </div>
-                    <div className="field">
-                      <label htmlFor="mailport">端口</label>
-                      <input
-                        id="mailport"
-                        className="input"
-                        type="number"
-                        value={form.email.port}
-                        onChange={(event) =>
-                          patch((draft) => (draft.email.port = event.target.value))
-                        }
-                      />
-                    </div>
+                  <div className="hint">通过邮件转发服务发送；填写地址、收件人及服务要求的认证密钥后，可先发送测试。</div>
+                  <div className="field">
+                    <label htmlFor="mail-webhook-url">邮件转发地址</label>
+                    <input
+                      id="mail-webhook-url"
+                      className="input"
+                      type="url"
+                      value={form.email.webhook_url}
+                      onChange={(event) => patch((draft) => (draft.email.webhook_url = event.target.value))}
+                      placeholder="https://mail.example.com/send"
+                    />
                   </div>
                   <div className="grid-2">
                     <div className="field">
-                      <label htmlFor="mailsec">加密方式</label>
-                      <select
-                        id="mailsec"
-                        className="select"
-                        value={form.email.security}
-                        onChange={(event) =>
-                          patch((draft) => (draft.email.security = event.target.value))
-                        }
-                      >
-                        <option value="ssl">SSL（465）</option>
-                        <option value="starttls">STARTTLS（587）</option>
-                        <option value="none">不加密</option>
-                      </select>
+                      <label htmlFor="mail-api-key">认证密钥（可选）</label>
+                      <input
+                        id="mail-api-key"
+                        className="input"
+                        type="password"
+                        value={form.email.api_key || ''}
+                        onChange={(event) => patch((draft) => (draft.email.api_key = event.target.value))}
+                        placeholder={form.email.api_key_configured ? '已配置，留空不修改' : '服务不要求认证时留空'}
+                        autoComplete="new-password"
+                      />
                     </div>
                     <div className="field">
                       <label htmlFor="mailto">收件人</label>
@@ -642,42 +622,8 @@ export default function SettingsDrawer({ settings, onClose, onSaved }: Props) {
                         id="mailto"
                         className="input"
                         value={form.email.to}
-                        onChange={(event) =>
-                          patch((draft) => (draft.email.to = event.target.value))
-                        }
-                        placeholder="noreply@example.com"
-                      />
-                    </div>
-                  </div>
-                  <div className="grid-2">
-                    <div className="field">
-                      <label htmlFor="mailuser">用户名</label>
-                      <input
-                        id="mailuser"
-                        className="input"
-                        value={form.email.username}
-                        onChange={(event) =>
-                          patch((draft) => (draft.email.username = event.target.value))
-                        }
-                        autoComplete="off"
-                      />
-                    </div>
-                    <div className="field">
-                      <label htmlFor="mailpass">密码 / 授权码</label>
-                      <input
-                        id="mailpass"
-                        className="input"
-                        type="password"
-                        value={mailPassword}
-                        onChange={(event) =>
-                          patch(
-                            (draft) =>
-                              (draft.email as unknown as { password: string }).password =
-                                event.target.value,
-                          )
-                        }
-                        placeholder={form.email.password_configured ? '已配置，留空不修改' : ''}
-                        autoComplete="new-password"
+                        onChange={(event) => patch((draft) => (draft.email.to = event.target.value))}
+                        placeholder="you@example.com"
                       />
                     </div>
                   </div>

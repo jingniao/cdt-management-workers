@@ -68,7 +68,7 @@ export async function api<T>(path: string, init: ApiInit = {}): Promise<T> {
   if (response.status === 204) return undefined as T
   const body = await response.json().catch(() => ({}))
   if (!response.ok) {
-    const detail = body?.error
+    const detail = body?.error ?? body
     throw new APIError(
       response.status,
       detail?.code ?? 'request_failed',

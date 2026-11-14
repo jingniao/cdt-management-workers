@@ -12,9 +12,8 @@
  * non-GET request, exactly like `_current_user` / `require_admin` /
  * `require_csrf` in api.py.
  *
- * Login rate limiting is in-memory (per isolate): it resets when the
- * isolate is recycled, so it is a best-effort guard, not a durable
- * lockout. See `rateLimited` below.
+ * Login rate limiting reserves attempts atomically in D1, shared across
+ * isolates. Storage errors refuse authentication rather than bypassing checks.
  *
  * NOTE (import assumptions — coordinator): sibling modules do not exist
  * yet. This file is written against CONTRACT.md and assumes:
@@ -48,6 +47,7 @@ import type { Context } from "hono";
 import type { Env } from "./env";
 import * as repo from "./repo";
 import * as security from "./security";
+import { reserveAuthAttempt, resetAuthAttempts } from "./auth-limits";
 import * as dns from "./dns";
 import * as ddns from "./ddns";
 import * as notify from "./notify";
@@ -209,7 +209,7 @@ async function sessionEpoch(env: Env): Promise<number> {
   try {
     return Number.parseInt((await repo.getSetting(env, "session_epoch")) || "0", 10) || 0;
   } catch {
-    return 0;
+    throw httpErr(503, "auth_unavailable", "暂时无法验证登录状态，请稍后重试");
   }
 }
 
@@ -230,10 +230,8 @@ async function currentUser(c: Ctx): Promise<string | null> {
     if (await repo.isSessionRevoked(c.env, await security.sessionId(token))) {
       return null;
     }
-  } catch (e) {
-    // Blacklist lookup failing (e.g. D1 hiccup) must not turn the whole
-    // request into a 500: the signature itself already verified.
-    console.warn("session revocation check failed, treating as not revoked", e);
+  } catch {
+    throw httpErr(503, "auth_unavailable", "暂时无法验证会话撤销状态，请稍后重试");
   }
   return user;
 }
@@ -259,61 +257,35 @@ async function attachSession(c: Ctx, username: string, epoch?: number): Promise<
   setCookie(c, SESSION_COOKIE, token, {
     maxAge: SESSION_TTL_SECONDS,
     httpOnly: true,
+    secure: new URL(c.req.url).protocol === "https:",
     sameSite: "Lax",
     path: "/",
   });
   setCookie(c, CSRF_COOKIE, await security.newCsrfToken(), {
     maxAge: SESSION_TTL_SECONDS,
     httpOnly: false,
+    secure: new URL(c.req.url).protocol === "https:",
     sameSite: "Lax",
     path: "/",
   });
 }
 
 // ---------------------------------------------------------------------------
-// Login rate limiting (in-memory — resets per isolate; see file header)
+// Login rate limiting: shared D1 atomic reservations, fail closed on errors.
 // ---------------------------------------------------------------------------
 
-const LOGIN_WINDOW = 300;
-const LOGIN_MAX_FAILURES = 8;
-const loginFailures = new Map<string, number[]>();
-
 function clientIp(c: Ctx): string {
-  // Workers always sits behind the Cloudflare edge, so cf-connecting-ip is
-  // authoritative here. (Python used the direct peer, falling back to
-  // X-Forwarded-For only when the peer was a private address.)
-  const cf = c.req.header("cf-connecting-ip")?.trim();
-  if (cf) return cf;
-  const xff = c.req.header("x-forwarded-for")?.split(",")[0]?.trim();
-  return xff || "unknown";
+  return c.req.header("cf-connecting-ip")?.trim() || "unknown";
 }
 
-function rateLimited(client: string): boolean {
-  const now = Date.now() / 1000;
-  // Prune stale entries when the map grows, so it cannot grow unboundedly
-  // with distinct visitor IPs (mirrors the Python cleanup).
-  if (loginFailures.size > 256) {
-    for (const [key, times] of loginFailures) {
-      const last = times[times.length - 1] ?? 0;
-      if (!times.length || now - last >= LOGIN_WINDOW) {
-        loginFailures.delete(key);
-      }
-    }
+async function checkAuthLimit(c: Ctx, key: string): Promise<void> {
+  let allowed: boolean;
+  try {
+    allowed = await reserveAuthAttempt(c.env, key);
+  } catch {
+    throw httpErr(503, "auth_unavailable", "暂时无法验证登录请求，请稍后重试");
   }
-  const attempts = (loginFailures.get(client) ?? []).filter((t) => now - t < LOGIN_WINDOW);
-  if (attempts.length) loginFailures.set(client, attempts);
-  else loginFailures.delete(client);
-  return attempts.length >= LOGIN_MAX_FAILURES;
-}
-
-function recordFailure(client: string): void {
-  const list = loginFailures.get(client) ?? [];
-  list.push(Date.now() / 1000);
-  loginFailures.set(client, list);
-}
-
-function resetFailures(client: string): void {
-  loginFailures.delete(client);
+  if (!allowed) throw httpErr(429, "rate_limited", "尝试过于频繁，请 5 分钟后再试");
 }
 
 // ---------------------------------------------------------------------------
@@ -382,6 +354,8 @@ const SETTING_LABELS: Record<string, string> = {
   notify_mail_security: "SMTP 加密",
   notify_mail_username: "SMTP 账号",
   notify_mail_password: "SMTP 密码",
+  notify_mail_webhook_url: "邮件转发地址",
+  notify_mail_api_key: "邮件认证密钥",
   notify_mail_to: "收件人",
   notify_wh_enabled: "Webhook 开关",
   notify_wh_url: "Webhook 地址",
@@ -753,6 +727,16 @@ function keepaliveWindowParts(payload: AnyRow): [string, string, number, number]
 }
 
 /** Draft settings form → config dict, for the "test connection" endpoints. */
+function emailWebhookUrl(value: unknown): string {
+  const text = strOf(value).trim();
+  if (!text) return "";
+  try {
+    const url = new URL(text);
+    if (url.protocol === "https:" && !url.username && !url.password) return text;
+  } catch { /* handled by the validation error below */ }
+  throw invalid("邮件转发地址必须是 HTTPS URL，且不能包含用户名或密码");
+}
+
 async function configFromDraft(env: Env, payload: AnyRow): Promise<Record<string, string>> {
   const saved = await repo.getSettings(env);
   const cfg: Record<string, string> = { ...saved };
@@ -803,6 +787,8 @@ async function configFromDraft(env: Env, payload: AnyRow): Promise<Record<string
 
   const mail = rowOf(payload["email"]);
   if (Object.keys(mail).length) {
+    if (mail["webhook_url"] !== undefined) cfg["notify_mail_webhook_url"] = emailWebhookUrl(mail["webhook_url"]);
+    if (mail["api_key"]) cfg["notify_mail_api_key"] = String(mail["api_key"]);
     putBool("notify_mail_enabled", mail["enabled"]);
     put("notify_mail_host", mail["host"]);
     put("notify_mail_port", mail["port"]);
@@ -862,16 +848,23 @@ app.post("/api/v1/setup", async (c) => {
   if (await isInitialized(c.env)) {
     throw httpErr(409, "conflict", "系统已初始化");
   }
+  if (!c.env.SESSION_SECRET || !c.env.ENCRYPTION_KEY) {
+    throw httpErr(503, "not_configured", "请先在 Cloudflare 配置 SESSION_SECRET 和 ENCRYPTION_KEY");
+  }
+  const client = `setup:${clientIp(c)}`;
+  await checkAuthLimit(c, client);
   const payload = await jsonBody(c);
+  if (!(await security.verifySetupKey(strOf(payload["setup_key"]), c.env.SESSION_SECRET))) {
+    throw httpErr(403, "invalid_setup_key", "初始化验证密钥不正确，请输入部署时保存的 SESSION_SECRET");
+  }
   const username = strOf(payload["username"]).trim();
   const password = strOf(payload["password"]);
   if (username.length < 3) throw invalid("用户名至少 3 个字符");
   if (password.length < 10) throw invalid("密码至少 10 个字符");
-  await repo.setSettings(c.env, {
-    admin_username: username,
-    admin_password: await security.hashPassword(password),
-    initialized: "1",
-  });
+  if (!(await repo.initializeAdmin(c.env, username, await security.hashPassword(password)))) {
+    throw httpErr(409, "conflict", "系统已初始化");
+  }
+  await resetAuthAttempts(c.env, client);
   await repo.addEvent(c.env, "system", messages.ev("系统初始化完成"), {
     detail: `已初始化 / 管理员 ${username}`,
   });
@@ -882,20 +875,17 @@ app.post("/api/v1/setup", async (c) => {
 // -- Auth -----------------------------------------------------------------
 
 app.post("/api/v1/auth/login", async (c) => {
-  const client = clientIp(c);
-  if (rateLimited(client)) {
-    throw httpErr(429, "rate_limited", "尝试过于频繁，请 5 分钟后再试");
-  }
+  const client = `login:${clientIp(c)}`;
+  await checkAuthLimit(c, client);
   const payload = await jsonBody(c);
   const username = strOf(payload["username"]).trim();
   const password = strOf(payload["password"]);
   const storedUser = await repo.getSetting(c.env, "admin_username");
   const storedHash = await repo.getSetting(c.env, "admin_password");
   if (username !== storedUser || !(await security.verifyPassword(password, storedHash ?? ""))) {
-    recordFailure(client);
     throw httpErr(401, "unauthorized", "用户名或密码不正确");
   }
-  resetFailures(client);
+  await resetAuthAttempts(c.env, client);
   await attachSession(c, username);
   return c.json({ ok: true, username });
 });
@@ -969,9 +959,8 @@ app.get("/api/v1/overview", async (c) => {
 app.post("/api/v1/reconcile", async (c) => {
   await requireAdmin(c);
   requireCsrf(c);
-  // SIMPLIFIED: shift.reconcileAll() returns void — the TS engine drops
-  // Python's lock/None protocol, so there is no per-item `results` list
-  // and no `busy` flag. The round still runs exactly once per call.
+  // ControlPlane serializes this request with cron and manual actions.
+  // Keep the existing frontend response shape (no per-item results).
   await reconcileAll(c.env);
   // Manual reconcile also sweeps DNS, same as Python.
   return c.json({
@@ -1325,7 +1314,7 @@ app.get("/api/v1/settings", async (c) => {
       enabled: config["ddns_enabled"] === "1",
       provider: config["ddns_provider"] || "cloudflare",
       cf_auth_mode: config["ddns_cf_auth_mode"] || "token",
-      cf_token_configured: Boolean(config["ddns_cf_token"]),
+      cf_token_configured: Boolean(config["ddns_cf_token"] || c.env.CLOUDFLARE_API_TOKEN),
       cf_email: config["ddns_cf_email"] || "",
       cf_key_configured: Boolean(config["ddns_cf_key"]),
       zone_id: config["ddns_zone_id"] || "",
@@ -1338,12 +1327,14 @@ app.get("/api/v1/settings", async (c) => {
     },
     telegram: {
       enabled: config["notify_tg_enabled"] === "1",
-      token_configured: Boolean(config["notify_tg_token"]),
-      chat_id: config["notify_tg_chat_id"] || "",
+      token_configured: Boolean(config["notify_tg_token"] || c.env.TELEGRAM_BOT_TOKEN),
+      chat_id: notify.telegramChatId(c.env, config),
       proxy: config["notify_tg_proxy"] || "",
     },
     email: {
       enabled: config["notify_mail_enabled"] === "1",
+      webhook_url: config["notify_mail_webhook_url"] || c.env.EMAIL_WEBHOOK_URL || "",
+      api_key_configured: Boolean(config["notify_mail_api_key"] || c.env.EMAIL_API_KEY),
       host: config["notify_mail_host"] || "",
       port: config["notify_mail_port"],
       security: config["notify_mail_security"] || "ssl",
@@ -1471,6 +1462,8 @@ app.post("/api/v1/settings", async (c) => {
 
   const mail = rowOf(payload["email"]);
   if (Object.keys(mail).length) {
+    if (mail["webhook_url"] !== undefined) updates["notify_mail_webhook_url"] = emailWebhookUrl(mail["webhook_url"]);
+    if (mail["api_key"]) updates["notify_mail_api_key"] = String(mail["api_key"]);
     putBool("notify_mail_enabled", mail["enabled"]);
     putStr("notify_mail_host", mail["host"]);
     putStr("notify_mail_port", mail["port"]);

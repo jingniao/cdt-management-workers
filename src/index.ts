@@ -2,12 +2,13 @@
  * Entrypoint — TypeScript port of `app/main.py` (app assembly + static
  * hosting) for Cloudflare Workers.
  *
- * - `fetch`: `/api/*` goes to the Hono app in `api.ts`; everything else
+ * - `fetch`: `/api/*` goes through the single ControlPlane Durable Object;
+ *   it dispatches to Hono after serializing mutations. Everything else
  *   falls back to `env.ASSETS` (the React frontend built into `web/dist`
  *   via wrangler `[assets]`, SPA fallback handled by wrangler config).
  *   If no assets binding is configured, non-API paths return the same
  *   503 "frontend not built" hint the Python placeholder returned.
- * - `scheduled`: runs one `runReconcile` round per cron tick. There is
+ * - `scheduled`: requests a serialized reconcile round from ControlPlane. There is
  *   no webhook path in this worker, so `scheduled` never runs anything
  *   else.
  *
@@ -20,8 +21,12 @@
  */
 
 import type { Env } from "./env";
-import { app } from "./api";
-import { runReconcile } from "./scheduler";
+export { ControlPlane } from "./control-plane";
+
+function coordinator(env: Env): DurableObjectStub {
+  if (!env.CONTROL_PLANE) throw new Error("CONTROL_PLANE binding is required");
+  return env.CONTROL_PLANE.get(env.CONTROL_PLANE.idFromName("deployment-control-plane"));
+}
 
 export default {
   async fetch(
@@ -31,7 +36,10 @@ export default {
   ): Promise<Response> {
     const url = new URL(request.url);
     if (url.pathname === "/api" || url.pathname.startsWith("/api/")) {
-      return app.fetch(request, env, ctx);
+      if (!env.CONTROL_PLANE) {
+        return Response.json({ ok: false, code: "not_configured", message: "控制服务未配置，请更新完整部署配置" }, { status: 503 });
+      }
+      return coordinator(env).fetch(request);
     }
     if (env.ASSETS) {
       return env.ASSETS.fetch(request);
@@ -50,6 +58,9 @@ export default {
     env: Env,
     ctx: ExecutionContext,
   ): Promise<void> {
-    ctx.waitUntil(runReconcile(env));
+    ctx.waitUntil((async () => {
+      const response = await coordinator(env).fetch("https://control.internal/__scheduled", { method: "POST" });
+      if (!response.ok) throw new Error(`Reconcile coordinator returned HTTP ${response.status}`);
+    })());
   },
 };

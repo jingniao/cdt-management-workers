@@ -241,6 +241,9 @@ export type Settings = {
   }
   email: {
     enabled: boolean
+    webhook_url: string
+    api_key_configured: boolean
+    api_key?: string
     host: string
     port: string
     security: string

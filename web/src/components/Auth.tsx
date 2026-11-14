@@ -12,6 +12,7 @@ export default function Auth({ mode, brand, onDone }: Props) {
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
   const [confirm, setConfirm] = useState('')
+  const [setupKey, setSetupKey] = useState('')
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
 
@@ -31,7 +32,8 @@ export default function Auth({ mode, brand, onDone }: Props) {
     setBusy(true)
     try {
       if (mode === 'setup') {
-        await post('/api/v1/setup', { username, password })
+        await post('/api/v1/setup', { username, password, setup_key: setupKey })
+        setSetupKey('')
       } else {
         await post('/api/v1/auth/login', { username, password })
       }
@@ -61,12 +63,28 @@ export default function Auth({ mode, brand, onDone }: Props) {
           <h1>{isSetup ? '设置管理员账号' : '登录面板'}</h1>
           <p className="lede">
             {isSetup
-              ? '首次使用，先创建管理员。密码用于登录面板，不会发送到任何第三方；AccessKey 等凭据会另外用本机主密钥加密存储。'
+              ? '先验证部署者身份，再创建管理员账号。登录密码由你设置，云服务和通知可在进入面板后配置。'
               : '输入管理员账号进入控制台。连续失败 8 次会锁定 5 分钟。'}
           </p>
         </div>
 
         <div className="auth-form">
+          {isSetup && (
+            <div className="field">
+              <label htmlFor="setup-key"><ShieldCheck size={13} /> 初始化验证密钥</label>
+              <input
+                id="setup-key"
+                className="input"
+                type="password"
+                value={setupKey}
+                onChange={(event) => setSetupKey(event.target.value)}
+                autoComplete="off"
+                placeholder="部署时保存的 SESSION_SECRET"
+                required
+              />
+              <div className="hint">仅首次初始化时验证，不作为日常登录密码。</div>
+            </div>
+          )}
           <div className="field">
             <label htmlFor="username">
               <UserCog size={13} /> 用户名
@@ -131,8 +149,8 @@ export default function Auth({ mode, brand, onDone }: Props) {
 
         <div className="auth-foot">
           {isSetup
-            ? '初始化完成后可用环境变量 CDT_ADMIN_USERNAME / CDT_ADMIN_PASSWORD 跳过这一步'
-            : '忘记密码：删除数据目录下的 cdt-management.db 会重置所有配置'}
+            ? '请确认这是你部署的面板地址。数据加密密钥 ENCRYPTION_KEY 请妥善备份。'
+            : '忘记密码请按项目文档恢复管理员账号，勿删除数据库，以免丢失配置。'}
         </div>
       </form>
     </div>

@@ -11,9 +11,7 @@
 #   3. 创建 D1 数据库（若 wrangler.toml 里的 database_id 还是占位符），
 #      并把真实 database_id 写回 wrangler.toml
 #   4. 应用 D1 迁移（本地 + 远端）
-#   5. 设置 Secrets：ADMIN_PASSWORD（必填，会问你）、SESSION_SECRET、
-#      ENCRYPTION_KEY（后两个不填就自动生成随机值）
-#      可选：CLOUDFLARE_API_TOKEN、TELEGRAM_BOT_TOKEN（留空跳过）
+#   5. 仅补充缺失的 SESSION_SECRET / ENCRYPTION_KEY，保留已有密钥
 #   6. npx wrangler deploy
 #
 # 注意：密钥只会通过 `wrangler secret put` 进 Cloudflare，不会写进任何文件。
@@ -90,59 +88,17 @@ fi
 
 # ---------- 4. 迁移 ----------
 step "应用 D1 迁移"
-npx wrangler d1 migrations apply cdt-management --local
-npx wrangler d1 migrations apply cdt-management --remote
+npx wrangler d1 migrations apply DB --local
+npx wrangler d1 migrations apply DB --remote
 
 # ---------- 5. Secrets ----------
-step "设置 Secrets（只进 Cloudflare，不写文件）"
-
-ask_secret() {
-  # ask_secret NAME "提示" [默认值]
-  local name="$1" prompt="$2" default="${3:-}"
-  local value=""
-  if [[ -n "$default" ]]; then
-    read -r -s -p "$prompt（留空则用自动生成的值）: " value || true
-    echo
-    [[ -z "$value" ]] && value="$default"
-  else
-    read -r -s -p "$prompt: " value || true
-    echo
-  fi
-  printf '%s' "$value" | npx wrangler secret put "$name" >/dev/null
-  echo "$name 已设置"
-}
-
-ask_optional_secret() {
-  # ask_optional_secret NAME "提示" — 留空跳过
-  local name="$1" prompt="$2" value=""
-  read -r -s -p "$prompt（可选，留空跳过）: " value || true
-  echo
-  if [[ -z "$value" ]]; then
-    echo "$name 跳过"
-    return
-  fi
-  printf '%s' "$value" | npx wrangler secret put "$name" >/dev/null
-  echo "$name 已设置"
-}
-
-rand_hex() { node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"; }
-rand_b64() { node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"; }
-
-echo "面板登录密码（首次初始化用，之后登录就用它）："
-ask_secret ADMIN_PASSWORD "ADMIN_PASSWORD"
-ask_secret SESSION_SECRET "SESSION_SECRET" "$(rand_hex)"
-ask_secret ENCRYPTION_KEY "ENCRYPTION_KEY（加密 AccessKey Secret 用）" "$(rand_b64)"
-ask_optional_secret CLOUDFLARE_API_TOKEN "CLOUDFLARE_API_TOKEN（DDNS 用）"
-ask_optional_secret TELEGRAM_BOT_TOKEN "TELEGRAM_BOT_TOKEN（通知用）"
-
-echo
-echo "提示：ENCRYPTION_KEY 丢了，库里存的 AccessKey Secret 就解不出来，"
-echo "请把它和 SESSION_SECRET 一起记到你自己的密码管理器里。"
+step "检查部署密钥（已有密钥保留，其余配置在面板填写）"
+bash scripts/setup-secrets.sh
 
 # ---------- 6. 部署 ----------
 step "部署到 Cloudflare Workers"
 npx wrangler deploy
 
 echo
-echo "部署完成。打开上面输出的 workers.dev 地址，用 ADMIN_PASSWORD 登录，"
-echo "首次登录会进初始化向导，然后在面板里加阿里云账号（先拿不重要的实例试）。"
+echo "部署完成。打开上面输出的 workers.dev 地址，用 SESSION_SECRET 验证首次初始化，"
+echo "创建管理员账号后，在面板设置 DDNS、Telegram、邮件，并添加阿里云实例。"

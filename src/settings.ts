@@ -11,7 +11,7 @@ export const APP_NAME = "cdt-management";
 export const VERSION = "1.3.11-workers";
 export const BRAND = "CDT-Management";
 // 实际部署的仓库（Workers 移植版）：「关于」页显示的仓库链接。
-export const REPO = "suangsuang888/cdt-management-workers";
+export const REPO = "jingniao/cdt-management-workers";
 // 上游 Docker 版仓库：仅用于「关于」页检查上游最新 release；
 // 本移植版的版本号带 -workers 后缀，比较时要去掉后缀再比基础版本。
 export const UPSTREAM_REPO = "BeacherZ/cdt-management";
@@ -132,6 +132,8 @@ export const DEFAULT_SETTINGS: Record<string, string> = {
   notify_mail_security: "ssl",
   notify_mail_username: "",
   notify_mail_password: "",
+  notify_mail_webhook_url: "",
+  notify_mail_api_key: "",
   notify_mail_to: "",
   // Webhook
   notify_wh_enabled: "0",

@@ -6,7 +6,7 @@
  * 所有渠道失败只记日志，绝不阻塞换班主流程。
  *
  * SIMPLIFIED: Workers 里没有 SMTP。邮件不走 SMTP 直发，见 `sendEmail`：
- *   - 设置了 `EMAIL_WEBHOOK_URL` 时，把消息 JSON POST 到该地址
+ *   - 面板配置邮件转发地址时，把消息 JSON POST 到该地址（兼容旧环境变量）
  *     （应指向 Resend / MailChannels / 自建中继等外部发信服务）；
  *   - 未设置时返回 `"email_not_configured"`，调用方把该结果记进事件，
  *     不要谎称「已发送」。
@@ -49,13 +49,13 @@ function isDryRun(env: Env): boolean {
   return env.CDT_DRY_RUN === "1";
 }
 
-/** Telegram Bot Token：优先用 Worker Secret，其次用设置里的 token。 */
+/** 面板设置优先，兼容旧部署的 Worker Secrets。 */
 export function telegramToken(env: Env, config: Record<string, string>): string {
-  return (env.TELEGRAM_BOT_TOKEN ?? "").trim() || (config["notify_tg_token"] ?? "").trim();
+  return (config["notify_tg_token"] ?? "").trim() || (env.TELEGRAM_BOT_TOKEN ?? "").trim();
 }
 
 export function telegramChatId(env: Env, config: Record<string, string>): string {
-  return (env.TELEGRAM_CHAT_ID ?? "").trim() || (config["notify_tg_chat_id"] ?? "").trim();
+  return (config["notify_tg_chat_id"] ?? "").trim() || (env.TELEGRAM_CHAT_ID ?? "").trim();
 }
 
 export function enabledChannels(
@@ -77,12 +77,12 @@ export function enabledChannels(
   ) {
     channels.push("telegram");
   }
-  // 邮件：Workers 没有 SMTP，改为 EMAIL_WEBHOOK_URL 转发；仍要求填了收件人，
+  // 邮件通过面板配置的 HTTPS 转发地址发送；仍要求填了收件人，
   // 否则 webhook 收到消息也不知道发给谁。
   if (
     cfg["notify_mail_enabled"] === "1" &&
     cfg["notify_mail_to"] &&
-    (env.EMAIL_WEBHOOK_URL || cfg["notify_mail_host"])
+    (cfg["notify_mail_webhook_url"] || env.EMAIL_WEBHOOK_URL)
   ) {
     channels.push("email");
   }
@@ -103,6 +103,8 @@ const SECRET_KEYS = [
   "notify_tg_token",
   "notify_tg_proxy",
   "notify_mail_password",
+  "notify_mail_api_key",
+  "notify_mail_webhook_url",
   "notify_mail_username",
   "notify_wh_url",
   "notify_wh_headers",
@@ -191,6 +193,7 @@ export async function send(
       throw new Error(result);
     }
   } else if (channel === "webhook") {
+    if (isDryRun(env)) return;
     await sendWebhook(config, message);
   } else {
     throw new Error(`未知通知渠道 ${channel}`);
@@ -306,7 +309,7 @@ async function sendTelegram(
  *
  * SIMPLIFIED: Cloudflare Workers 没有 SMTP 能力，原 Python 的 smtplib 直发
  * 无法移植，也不做「假装发出」的实现。
- *   - `EMAIL_WEBHOOK_URL` 已设置：把消息 JSON POST 到该地址，返回 `"ok"`。
+ *   - 面板转发地址或旧环境 `EMAIL_WEBHOOK_URL` 已设置：POST 消息 JSON。
  *     该地址应指向 Resend / MailChannels / 自建中继等外部发信服务，
  *     由对方按 `to` / `subject` / `html` 发信。
  *   - 未设置：返回 `"email_not_configured"`，`send()` 会把它转成异常，
@@ -318,7 +321,7 @@ export async function sendEmail(
   config: Record<string, string>,
   message: Message,
 ): Promise<string> {
-  const hookUrl = (env.EMAIL_WEBHOOK_URL ?? "").trim();
+  const hookUrl = (config["notify_mail_webhook_url"] ?? "").trim() || (env.EMAIL_WEBHOOK_URL ?? "").trim();
   if (!hookUrl) {
     return "email_not_configured";
   }
@@ -328,8 +331,9 @@ export async function sendEmail(
   }
   const recipient = (config["notify_mail_to"] ?? "").trim();
   const headers: Record<string, string> = { "Content-Type": "application/json" };
-  if (env.EMAIL_API_KEY) {
-    headers["Authorization"] = `Bearer ${env.EMAIL_API_KEY}`;
+  const apiKey = config["notify_mail_api_key"] || env.EMAIL_API_KEY;
+  if (apiKey) {
+    headers["Authorization"] = `Bearer ${apiKey}`;
   }
   const response = await fetch(hookUrl, {
     method: "POST",

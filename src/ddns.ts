@@ -147,8 +147,8 @@ function headersFor(env: Env, config: Record<string, string>): Record<string, st
     }
     return { "X-Auth-Email": email, "X-Auth-Key": key, "Content-Type": "application/json" };
   }
-  // 优先用 Worker Secret，其次用设置里保存的 token。
-  const token = (env.CLOUDFLARE_API_TOKEN ?? "").trim() || (config["ddns_cf_token"] ?? "");
+  // 面板设置优先，兼容旧部署的 Worker Secret。
+  const token = (config["ddns_cf_token"] ?? "").trim() || (env.CLOUDFLARE_API_TOKEN ?? "").trim();
   if (!token) {
     throw new Error("Cloudflare API Token 未配置");
   }
@@ -193,11 +193,6 @@ export function isPublicIpv4(value: string): boolean {
   return true;
 }
 
-function rootDomain(record: string): string {
-  const parts = record.trim().split(".");
-  return parts.length >= 2 ? parts.slice(-2).join(".") : record;
-}
-
 async function resolveZoneId(
   headers: Record<string, string>,
   config: Record<string, string>,
@@ -210,20 +205,26 @@ async function resolveZoneId(
   if (!record) {
     throw new Error("DDNS 记录名未配置");
   }
-  const root = rootDomain(record);
-  const url = `${API}/zones?name=${encodeURIComponent(root)}&status=active`;
-  const response = await fetch(url, {
-    headers,
-    signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
-  });
-  const payload = (await response.json().catch(() => ({}))) as {
-    result?: Array<{ id: string }>;
-  };
-  const zones = payload.result ?? [];
-  if (response.status !== 200 || zones.length === 0) {
-    throw new Error(`无法自动识别 ${root} 的 Zone ID，请手动填写`);
+  // Match actual accessible zones from longest suffix to shortest. This also
+  // handles delegated subdomain zones without guessing public suffix rules.
+  const labels = record.toLowerCase().replace(/\.$/, "").split(".");
+  for (let start = 0; start < labels.length - 1; start++) {
+    const candidate = labels.slice(start).join(".");
+    const response = await fetch(`${API}/zones?name=${encodeURIComponent(candidate)}&status=active`, {
+      headers,
+      signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
+    });
+    const payload = (await response.json().catch(() => ({}))) as {
+      success?: boolean;
+      result?: Array<{ id: string; name: string }>;
+    };
+    if (!response.ok || payload.success !== true) {
+      throw new Error(`Cloudflare Zone 查询失败（HTTP ${response.status}），请检查 Token 权限`);
+    }
+    const zone = payload.result?.find(item => item.name?.toLowerCase() === candidate);
+    if (zone?.id) return zone.id;
   }
-  return String((zones[0] as { id: string }).id);
+  throw new Error(`无法自动识别 ${record} 的 Zone ID，请手动填写`);
 }
 
 /** 查询记录，返回 [记录 ID, 当前指向的 IP]。 */

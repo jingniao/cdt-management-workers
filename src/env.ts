@@ -4,8 +4,8 @@
 // without coordinating with them.
 export interface Env {
   DB: D1Database;
+  CONTROL_PLANE: DurableObjectNamespace;
   ASSETS?: Fetcher;
-  ADMIN_PASSWORD?: string;
   SESSION_SECRET?: string;
   ENCRYPTION_KEY?: string;          // base64, 32 bytes; encrypts AccessKey secrets in D1
   CLOUDFLARE_API_TOKEN?: string;
