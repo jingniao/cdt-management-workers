@@ -34,7 +34,23 @@ node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"
 2. 进入「服务器」，添加阿里云 AccessKey ID、AccessKey Secret、地域、实例 ID，并设置流量配额和停机阈值。
 3. 配置保活或换班后，回到概览点击「立即同步」，检查运行状态和最近事件。
 
-阿里云 RAM 用户需具备 `AliyunECSFullAccess` 和 `AliyunCDTReadOnlyAccess`；需要查询账单、余额时，再配置 `AliyunBSSReadOnlyAccess`。
+## 获取阿里云 AccessKey
+
+推荐使用专用 RAM 用户，避免使用阿里云主账号的密钥。
+
+1. 登录 [RAM 控制台（国内站）](https://ram.console.aliyun.com/users)或[国际站](https://ram.console.alibabacloud.com/users)，进入「身份管理 → 用户」，创建一个专用用户。
+2. 给该用户添加所需权限：
+
+   | 权限策略 | 用途 |
+   | --- | --- |
+   | `AliyunECSFullAccess` | 查询、启动和停止 ECS 实例 |
+   | `AliyunCDTReadOnlyAccess` | 查询 CDT 流量 |
+   | `AliyunBSSReadOnlyAccess` | 查询账单和余额，不使用费用功能可不添加 |
+
+3. 打开用户详情，在「认证管理 → AccessKey」中创建 AccessKey，按提示完成验证。
+4. 保存生成的 **AccessKey ID** 和 **AccessKey Secret**。Secret 仅在创建时显示，请立即妥善保存，不要提交到 GitHub 或发送到聊天中。
+
+密钥应来自实例所属的阿里云账号；国内站与国际站请分别使用对应站点的账号。
 
 ## 面板配置
 
