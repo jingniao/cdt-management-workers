@@ -194,6 +194,7 @@ function emptyRun(): ShiftRun {
     phase: PHASE_PENDING,
     stage: "",
     event_id: 0,
+    settled_event_id: 0,
     duty_server_id: 0,
     standby_server_ids: "",
     failover: 0,
@@ -335,7 +336,7 @@ export function keepaliveWindowDetail(
   const start = startRaw ? hhmmToMinutes(startRaw) : -1;
   let end = endRaw ? hhmmToMinutes(endRaw) : -1;
   if (end === 0 && start > 0) end = 24 * 60;
-  const timed = start >= 0 && end > start;
+  const timed = start >= 0 && end >= 0;
 
   let dayStart = parseInt(s(item.start_day ?? 0), 10) || 0;
   let dayEnd = parseInt(s(item.end_day ?? 0), 10) || 0;
@@ -348,7 +349,7 @@ export function keepaliveWindowDetail(
   const parts: string[] = [];
   if (timed) {
     const endLabel = end === 24 * 60 ? "24:00" : endRaw;
-    parts.push(`每天 ${startRaw}–${endLabel}`);
+    parts.push(start === end ? "每天全天" : `每天 ${startRaw}–${end < start ? "次日 " : ""}${endLabel}`);
   }
   if (dated) parts.push(`${dayStart}–${dayEnd} 日`);
   const summary = parts.join(" · ");
@@ -356,7 +357,8 @@ export function keepaliveWindowDetail(
   const now = tzParts(tz, nowTs);
   if (timed) {
     const minute = now.hour * 60 + now.minute;
-    if (!(start <= minute && minute < end)) return [false, summary];
+    const inWindow = start === end || (end > start ? start <= minute && minute < end : minute >= start || minute < end);
+    if (!inWindow) return [false, summary];
   }
   if (dated) {
     const days = monthDays(now.year, now.month);
@@ -780,12 +782,7 @@ function briefExc(exc: unknown): string {
 }
 
 async function retryInterval(env: Env): Promise<number> {
-  try {
-    const raw = await repo.getSetting(env, "reconcile_interval", "60");
-    return Math.max(30, parseInt(raw, 10) || 60);
-  } catch {
-    return 60;
-  }
+  return resolveSettings(env).reconcileIntervalSeconds;
 }
 
 // ---------------------------------------------------------------------------
@@ -821,7 +818,23 @@ async function resolveEmptyTraffic(
   return 0;
 }
 
+type RuntimeSnapshot = Pick<ServerView, "traffic_used" | "instance_status" | "stopped_mode" | "public_ip" | "region_id">;
+const roundStates = new WeakMap<Env, Map<number, Promise<RuntimeSnapshot>>>();
 async function refreshServerState(env: Env, server: ServerView): Promise<void> {
+  const cache = roundStates.get(env);
+  if (!cache) return readServerState(env, server);
+  let pending = cache.get(server.id);
+  if (!pending) {
+    pending = readServerState(env, server).then(() => ({
+      traffic_used: server.traffic_used, instance_status: server.instance_status,
+      stopped_mode: server.stopped_mode, public_ip: server.public_ip, region_id: server.region_id,
+    }));
+    cache.set(server.id, pending);
+  }
+  Object.assign(server, await pending);
+}
+
+async function readServerState(env: Env, server: ServerView): Promise<void> {
   const nowTs = Math.floor(Date.now() / 1000);
   const realTraffic = await aliyun.getTrafficGb(env, account(server));
   const emptyReading = realTraffic === null;
@@ -1499,9 +1512,9 @@ async function limitStopServer(
 // reconcile_keepalives / reconcile_idle_limits
 // ---------------------------------------------------------------------------
 
-async function groupedServerIds(env: Env): Promise<Set<number>> {
+async function groupedServerIds(env: Env, groups?: ShiftGroup[]): Promise<Set<number>> {
   const ids = new Set<number>();
-  for (const group of await repo.listGroups(env)) {
+  for (const group of groups ?? await repo.listGroups(env)) {
     if (!truthy(group.enabled)) continue;
     const members = activeMembers(group);
     if (members.length < 2) continue;
@@ -2505,6 +2518,7 @@ export async function reconcileGroup(
 
   // 3) Guarantee the duty instance is running — start duty only.
   const previouslySettled = SETTLED_LIKE_PHASES.has(s(run.phase));
+  const settledBefore = previouslySettled || (eventId > 0 && num(run.settled_event_id) === eventId);
   const restartClock = previouslySettled
     ? { started_at: Math.floor(nowTs) }
     : {};
@@ -2513,7 +2527,7 @@ export async function reconcileGroup(
     dutyStatus !== "Running" && !TRANSIENT_STATUS.has(dutyStatus);
 
   if (dutyNotRunning) {
-    if (previouslySettled) {
+    if (settledBefore) {
       await repo.setFlag(env, recoveryFlag);
       eventId = await repo.addEvent(
         env,
@@ -2547,9 +2561,9 @@ export async function reconcileGroup(
       );
     }
 
-    await repo.bumpFlag(env, triesFlag);
     try {
       await aliyun.startInstance(env, account(duty));
+      await repo.bumpFlag(env, triesFlag);
       await repo.clearFlag(env, `start_err:${groupId}:${slotKey}`);
       await repo.addEventProgress(
         env,
@@ -2559,6 +2573,7 @@ export async function reconcileGroup(
       await repo.updateEvent(env, eventId, { detail: "等待开机到位" });
       dutyStatus = "Starting";
     } catch (exc) {
+      if (!["auth", "throttle"].includes(aliyun.classifyError(exc))) await repo.bumpFlag(env, triesFlag);
       const flag = `start_err:${groupId}:${slotKey}`;
       if (!(await repo.getFlag(env, flag))) {
         await repo.setFlag(env, flag);
@@ -2605,7 +2620,7 @@ export async function reconcileGroup(
       );
       return { group_id: groupId, error: String(exc) };
     }
-  } else if (!previouslySettled) {
+  } else if (!settledBefore) {
     eventId = await shiftEvent(
       env,
       groupId,
@@ -2680,7 +2695,7 @@ export async function reconcileGroup(
     };
   }
 
-  if (!previouslySettled) {
+  if (!settledBefore) {
     await repo.addEventProgress(
       env,
       eventId,
@@ -2733,7 +2748,7 @@ export async function reconcileGroup(
     allStopped = false;
   }
 
-  if (allStopped && !previouslySettled) {
+  if (allStopped && !settledBefore) {
     await repo.addEventProgress(
       env,
       eventId,
@@ -2749,7 +2764,7 @@ export async function reconcileGroup(
   let ddnsOk = true;
   if (allStopped) {
     ddnsReport = await syncDdns(env, duty, config, dns.TARGET_GROUP, groupId, {
-      verify: !previouslySettled,
+      verify: !settledBefore,
     });
     ddnsText = ddnsReport.status;
     ddnsBrief = ddnsReport.brief;
@@ -2758,7 +2773,7 @@ export async function reconcileGroup(
       (await repo.dnsRecordsOf(env, dns.TARGET_SERVER, duty.id)).length > 0;
     ddnsOk =
       !ddnsEnabled || !ddnsBound || dns.isSuccess(ddnsText);
-    if (previouslySettled && !ddnsOk) ddnsOk = true;
+    if (settledBefore && !ddnsOk) ddnsOk = true;
 
     const waitKey = `ddns_wait:${groupId}:${slotKey}`;
     if (ddnsOk) {
@@ -2784,7 +2799,7 @@ export async function reconcileGroup(
         );
       }
     }
-    if (!previouslySettled && ddnsReport !== null) {
+    if (!settledBefore && ddnsReport !== null) {
       const text = `DDNS：${ddnsReport.detail}`;
       const existing = await repo.getEvent(env, eventId);
       const logged = (existing?.progress ?? []).some((step) =>
@@ -2807,7 +2822,7 @@ export async function reconcileGroup(
     (await repo.getFlag(env, recoveryFlag)) &&
     !failoverFlag &&
     !manualSwitch;
-  const firstSettle = ready && !previouslySettled && !recovered;
+  const firstSettle = ready && !settledBefore && !recovered;
   let phase: string;
   if (!ready) {
     phase = PHASE_SWITCHING;
@@ -2826,7 +2841,7 @@ export async function reconcileGroup(
     standby_server_ids: encodeIds(others),
     failover: failoverFlag,
     attempts: num(run.attempts) + 1,
-    ...(ready ? {} : restartClock),
+    ...(ready ? { settled_event_id: eventId } : restartClock),
   });
 
   const summary: ReconcileResult = {
@@ -3470,21 +3485,21 @@ export async function refreshServer(
 // Daily report
 // ---------------------------------------------------------------------------
 
-export async function dailyReport(env: Env): Promise<boolean> {
-  const config = await repo.getSettings(env);
+export async function dailyReport(env: Env, suppliedConfig?: Config, refresh = true, reportDate?: string): Promise<boolean> {
+  const config = suppliedConfig ?? await repo.getSettings(env);
   const tz = config.timezone ?? "Asia/Shanghai";
-  const today = dayKey(tz, Math.floor(Date.now() / 1000));
+  const today = reportDate ?? dayKey(tz, Math.floor(Date.now() / 1000));
   const flag = `daily_report:${today}`;
   if (await repo.getFlag(env, flag)) return false;
 
   const servers: ServerView[] = [];
-  for (const server of await repo.listServers(env, true)) {
+  for (const server of await repo.listServers(env, refresh)) {
     try {
-      await refreshServerState(env, server);
+      if (refresh) await refreshServerState(env, server);
     } catch {
       // A single unreadable server must not block the daily report.
     }
-    servers.push((await repo.getServer(env, server.id)) ?? server);
+    servers.push(refresh ? (await repo.getServer(env, server.id)) ?? server : server);
   }
   if (servers.length === 0) return false;
 
@@ -3508,58 +3523,167 @@ export async function dailyReport(env: Env): Promise<boolean> {
 // Confirm pending manual events (port of Python `_confirm_pending_events`)
 // ---------------------------------------------------------------------------
 
-/**
- * The Python original ran a 5-second confirm thread: after a manual
- * start/stop it polled DescribeInstances until the instance reached the
- * target state, then finished the "running" event. That thread was never
- * ported — nothing in the Workers reconcile round finished manual events,
- * so the first manual start left a forever-"running" event behind and
- * `manualAction`'s duplicate guard (`pendingManualExists`) then swallowed
- * every later start for the same target state with a silent 200 (no API
- * call, no error). This step runs once per reconcile round (1-minute cron
- * / on-demand reconcile): it re-reads each waiting manual event's
- * instance and finishes the event once the target state is reached, or
- * after a 10-minute timeout so a stuck wait can never block manual
- * control again.
- */
-const MANUAL_CONFIRM_TIMEOUT_SECONDS = 600;
+// Confirm pending manual, keepalive and limit-stop events on each scheduled round.
+const EVENT_CONFIRM_TIMEOUT_SECONDS = 600;
 
-async function confirmPendingManualEvents(env: Env): Promise<void> {
+async function confirmPendingEvents(env: Env, config: Config): Promise<void> {
   const nowTs = Math.floor(Date.now() / 1000);
-  for (const event of await repo.runningPendingEvents(env, "manual")) {
-    const server = await repo.getServer(env, num(event.server_id), true);
+  const tz = config.timezone ?? "Asia/Shanghai";
+  let keepaliveIds: Set<number> | null = null;
+  let keepaliveSchedules: Record<number, repo.KeepaliveSchedule> | null = null;
+  for (const event of await repo.listPendingEvents(env)) {
+    const serverId = num(event.server_id);
+    const target = s(event.pending_status);
+    const kind = s(event.pending_kind);
+    if (!serverId || !target) {
+      await repo.finishEvent(env, event.id, "error", "缺少待确认目标，已终止");
+      continue;
+    }
+
+    if (kind === "keepalive") {
+      if (keepaliveIds === null) keepaliveIds = await repo.keepaliveServerIds(env);
+      if (!keepaliveIds.has(serverId)) {
+        await repo.finishEvent(env, event.id, "error", "已移出单机保活，停止拉起");
+        await repo.clearFlag(env, `keepalive_tries:${serverId}`);
+        continue;
+      }
+      if (keepaliveSchedules === null) keepaliveSchedules = await repo.keepaliveSchedules(env);
+      const schedule = keepaliveSchedules[serverId];
+      if (schedule && truthy(schedule.enabled)) {
+        const [inWindow, windowText] = keepaliveWindowDetail(
+          schedule as unknown as Row,
+          nowTs,
+          tz,
+        );
+        if (!inWindow) {
+          const row = await repo.getServer(env, serverId);
+          const label = s(row?.label) || `#${serverId}`;
+          await repo.addEventProgress(
+            env,
+            event.id,
+            `已离开运行窗口${windowBracket(windowText)}，窗口外不再自动拉起`,
+          );
+          await repo.updateEvent(env, event.id, {
+            title: messages.ev("单机保活窗口暂停", messages.objServer(label)),
+            level: "info",
+            kind: "keepalive_pause",
+          });
+          await repo.retargetEvent(env, event.id, "Stopped", "keepalive_stop");
+          await repo.updateEvent(env, event.id, { detail: "等待停机到位" });
+          await repo.setFlag(env, `keepalive_rest:${serverId}`);
+          await repo.clearFlag(env, `keepalive_tries:${serverId}`);
+          continue;
+        }
+      }
+    }
+
+    const server = await repo.getServer(env, serverId, true);
     if (server === null) {
-      await repo.finishEvent(env, event.id, "error", "服务器已删除，等待收尾");
+      await repo.finishEvent(env, event.id, "error", "服务器已被删除");
       continue;
     }
     try {
       await refreshServerState(env, server);
-    } catch {
-      // Unreadable this round: keep waiting; the timeout below still applies.
-    }
-    const fresh = (await repo.getServer(env, server.id)) ?? server;
-    const status = s(fresh.instance_status);
-    const target = s(event.pending_status);
-    if (target && status === target) {
-      await repo.addEventProgress(env, event.id, `已确认到位：${status}`);
-      await repo.finishEvent(env, event.id, "done", `已确认${status}`);
+    } catch (exc) {
+      await repo.addEventProgress(env, event.id, `状态查询失败：${aliyun.briefError(exc)}`, { once: true });
+      if (kind !== "keepalive" && nowTs - num(event.pending_ts || event.ts) > EVENT_CONFIRM_TIMEOUT_SECONDS) {
+        await repo.finishEvent(env, event.id, "error", "超时，无法读取最新状态");
+      }
       continue;
     }
-    const waited = nowTs - num(event.pending_ts || event.ts);
-    if (waited > MANUAL_CONFIRM_TIMEOUT_SECONDS) {
-      const waitedMin = Math.max(1, Math.floor(waited / 60));
-      await repo.addEventProgress(
-        env,
-        event.id,
-        `等待超时（${waitedMin} 分钟），实例状态仍为 ${status || "未知"}`,
-      );
-      await repo.finishEvent(
-        env,
-        event.id,
-        "error",
-        `等待${target || "目标状态"}超时，实例状态仍为 ${status || "未知"}`,
-      );
+    const fresh = (await repo.getServer(env, serverId)) ?? server;
+    const status = s(fresh.instance_status);
+    if (status !== target) {
+      const waited = nowTs - num(event.pending_ts || event.ts);
+      if (kind !== "keepalive" && waited > EVENT_CONFIRM_TIMEOUT_SECONDS) {
+        await repo.addEventProgress(env, event.id, "等待状态超时，未确认到位");
+        await repo.finishEvent(env, event.id, "error", "超时未确认");
+        continue;
+      }
+      if (kind === "keepalive") continue;
+      const suffix = messages.statusSuffix(status, fresh.stopped_mode);
+      await repo.addEventProgress(env, event.id, `当前 ${status}${suffix}，等待到位`);
+      continue;
     }
+
+    const steps: string[] = [];
+    const record = async (text: string, summary?: string): Promise<void> => {
+      await repo.addEventProgress(env, event.id, text);
+      steps.push(summary ?? text);
+    };
+    await record(
+      `已确认 ${status}${messages.statusSuffix(status, fresh.stopped_mode)}`,
+      messages.resultLabel(status, fresh.stopped_mode),
+    );
+
+    if (kind === "keepalive" || target === "Running") {
+      const quiet = kind === "keepalive" && s(event.kind) === "keepalive_quiet";
+      if (kind === "keepalive") {
+        const tries = await repo.flagValue(env, `keepalive_tries:${serverId}`);
+        if (tries > 1) await record(`共尝试拉起 ${tries} 次`);
+      }
+      // DDNS sync on confirm (verify=True: force one real read).
+      let ddnsReport: DDNSReport | null = null;
+      let ddnsStatus = "❌ 同步异常";
+      try {
+        ddnsReport = await syncDdns(env, fresh, config, dns.TARGET_SERVER, serverId, {
+          ip: fresh.public_ip,
+          verify: true,
+        });
+        ddnsStatus = ddnsReport.status;
+      } catch (exc) {
+        ddnsStatus = `❌ 同步异常：${briefExc(exc)}`;
+      }
+      if (ddnsReport === null) {
+        await record(`DDNS：${ddnsStatus}`, "❌ 同步异常");
+      } else {
+        await record(`DDNS：${ddnsReport.detail}`, ddnsReport.brief);
+      }
+
+      if (kind === "keepalive") {
+        const doneTitle = quiet ? "单机保活窗口恢复" : "单机保活抢占恢复";
+        await repo.updateEvent(env, event.id, {
+          title: messages.ev(doneTitle, messages.objServer(fresh.label || "")),
+        });
+        await repo.clearFlag(env, `keepalive_tries:${serverId}`);
+        // Only non-quiet pull-ups notify: a window-resume is planned,
+        // pushing "疑被抢占" for it would be a false alarm. Gated by
+        // notify_on_keepalive (the "实例恢复运行" toggle sets this
+        // together with notify_on_recovery).
+        if (config.notify_on_keepalive === "1" && !quiet) {
+          try {
+            const results = await notify.sendAll(
+              env,
+              config,
+              messages.recovery(
+                info(fresh),
+                ddnsStatus,
+                "实例疑被抢占，已自动恢复运行。",
+                "keepalive",
+              ),
+            );
+            await notify.noteNotify(env, event.id, results);
+          } catch (exc) {
+            await record(`通知发送失败：${briefExc(exc)}`, "❌ 通知发送失败");
+          }
+        }
+      }
+
+    }
+
+    let summary = steps.join(" / ");
+    if (kind === "keepalive_stop") {
+      summary = `已暂停（${messages.modeLabel(fresh.stopped_mode) || "停机"}）`;
+    } else if (kind === "limit_stop") {
+      let reasonText = s(event.detail).trim();
+      if (reasonText.startsWith("等待停机到位")) {
+        const idx = reasonText.indexOf(" / ");
+        reasonText = idx >= 0 ? reasonText.slice(idx + 3).trim() : "";
+      }
+      const result = messages.resultLabel(status, fresh.stopped_mode);
+      summary = reasonText ? `${result} / ${reasonText}` : result;
+    }
+    await repo.finishEvent(env, event.id, "done", summary);
   }
 }
 
@@ -3567,16 +3691,19 @@ async function confirmPendingManualEvents(env: Env): Promise<void> {
 // Top-level entry: reconcile_all
 // ---------------------------------------------------------------------------
 
-export async function reconcileAll(env: Env): Promise<void> {
+export async function reconcileAll(sourceEnv: Env, suppliedConfig?: Config): Promise<void> {
+  const env = { ...sourceEnv };
   // Secondary re-entry guard; ControlPlane serializes external callers.
   if (reconciling) return;
   reconciling = true;
   try {
-    const config = await repo.getSettings(env);
+    roundStates.set(env, new Map());
+    const config = suppliedConfig ?? await repo.getSettings(env);
     const tz = config.timezone ?? "Asia/Shanghai";
     const nowTs = Math.floor(Date.now() / 1000);
 
-    const grouped = await groupedServerIds(env);
+    const groups = await repo.listGroups(env);
+    const grouped = await groupedServerIds(env, groups);
     const keepaliveIds = await repo.keepaliveServerIds(env);
 
     try {
@@ -3602,13 +3729,13 @@ export async function reconcileAll(env: Env): Promise<void> {
     }
 
     try {
-      await confirmPendingManualEvents(env);
+      await confirmPendingEvents(env, config);
     } catch {
       // A failed confirm round must never fail the whole round; the
       // next tick retries, and the timeout still bounds the wait.
     }
 
-    for (const group of await repo.listGroups(env)) {
+    for (const group of groups) {
       try {
         await reconcileGroup(env, group, config, nowTs);
       } catch (exc) {
@@ -3634,6 +3761,7 @@ export async function reconcileAll(env: Env): Promise<void> {
       // Orphan cleanup must never fail the round.
     }
   } finally {
+    roundStates.delete(env);
     reconciling = false;
   }
 }

@@ -696,12 +696,6 @@ function keepaliveWindowParts(payload: AnyRow): [string, string, number, number]
     if (!repo.isHhmm(startRaw) || !repo.isHhmm(endRaw)) {
       throw invalid("运行时段要用 HH:MM 格式，例如 08:00");
     }
-    let startMin = Number(startRaw.slice(0, 2)) * 60 + Number(startRaw.slice(3));
-    let endMin = Number(endRaw.slice(0, 2)) * 60 + Number(endRaw.slice(3));
-    if (endMin === 0 && startMin > 0) endMin = 24 * 60;
-    if (endMin <= startMin) {
-      throw invalid("运行时段的结束时刻必须晚于开始时刻（不支持跨零点；结束填 00:00 表示到 24:00）");
-    }
   }
   let startDay: number;
   let endDay: number;
@@ -781,6 +775,7 @@ async function configFromDraft(env: Env, payload: AnyRow): Promise<Record<string
   if (Object.keys(tg).length) {
     putBool("notify_tg_enabled", tg["enabled"]);
     put("notify_tg_chat_id", tg["chat_id"]);
+    if (strOf(tg["proxy"]).trim()) throw invalid("Workers 不支持此 Telegram 代理设置");
     put("notify_tg_proxy", tg["proxy"]);
     if (tg["token"]) cfg["notify_tg_token"] = String(tg["token"]);
   }
@@ -814,6 +809,17 @@ async function configFromDraft(env: Env, payload: AnyRow): Promise<Record<string
 // ---------------------------------------------------------------------------
 
 export const app = new Hono<Bindings>();
+
+/** Cheap preflight outside ControlPlane's queue; routes still revalidate. */
+export const mutationGuard = new Hono<Bindings>();
+mutationGuard.all("*", async (c) => {
+  await requireAdmin(c);
+  requireCsrf(c);
+  return c.body(null, 204);
+});
+mutationGuard.onError((err) => err instanceof ApiError
+  ? Response.json({ ok: false, code: err.code, message: err.message }, { status: err.status })
+  : Response.json({ ok: false, code: "auth_unavailable", message: "暂时无法验证登录状态" }, { status: 503 }));
 
 app.onError((err, c) => {
   if (err instanceof ApiError) {
@@ -880,13 +886,13 @@ app.post("/api/v1/auth/login", async (c) => {
   const payload = await jsonBody(c);
   const username = strOf(payload["username"]).trim();
   const password = strOf(payload["password"]);
-  const storedUser = await repo.getSetting(c.env, "admin_username");
-  const storedHash = await repo.getSetting(c.env, "admin_password");
-  if (username !== storedUser || !(await security.verifyPassword(password, storedHash ?? ""))) {
+  const stored = await repo.getAdminCredentials(c.env);
+  if (username !== stored.username || !(await security.verifyPassword(password, stored.passwordHash))) {
     throw httpErr(401, "unauthorized", "用户名或密码不正确");
   }
+  if ((await sessionEpoch(c.env)) !== stored.epoch) throw httpErr(401, "unauthorized", "登录凭据已变更，请重新登录");
   await resetAuthAttempts(c.env, client);
-  await attachSession(c, username);
+  await attachSession(c, username, stored.epoch);
   return c.json({ ok: true, username });
 });
 
@@ -1300,7 +1306,7 @@ app.get("/api/v1/settings", async (c) => {
     reconcile_interval: config["reconcile_interval"],
     reconcile_offset: config["reconcile_offset"] || "0",
     billing_enabled: (config["billing_enabled"] ?? "1") === "1",
-    billing_interval: config["billing_interval"] || "600",
+    billing_interval: config["billing_interval"] || "21600",
     daily_report_enabled: config["daily_report_enabled"] === "1",
     daily_report_time: config["daily_report_time"],
     notify_on_shift: config["notify_on_shift"] === "1",
@@ -1380,12 +1386,12 @@ app.post("/api/v1/settings", async (c) => {
   }
   if (payload["reconcile_interval"] !== null && payload["reconcile_interval"] !== undefined) {
     const interval = asInt(payload["reconcile_interval"], "同步间隔");
-    if (interval < 30 || interval > 3600) throw invalid("同步间隔应在 30–3600 秒之间");
+    if (interval !== 300) throw invalid("当前部署固定每 5 分钟巡检，不能通过面板改变定时触发器");
     updates["reconcile_interval"] = String(interval);
   }
   if (payload["reconcile_offset"] !== null && payload["reconcile_offset"] !== undefined) {
     const offset = asInt(payload["reconcile_offset"], "巡检起始秒");
-    if (offset < 0 || offset > 59) throw invalid("巡检起始秒应在 0–59 之间");
+    if (offset !== 0) throw invalid("当前部署不支持自定义巡检起始秒");
     updates["reconcile_offset"] = String(offset);
   }
 
@@ -1456,6 +1462,7 @@ app.post("/api/v1/settings", async (c) => {
   if (Object.keys(tg).length) {
     putBool("notify_tg_enabled", tg["enabled"]);
     putStr("notify_tg_chat_id", tg["chat_id"]);
+    if (strOf(tg["proxy"]).trim()) throw invalid("Workers 不支持此 Telegram 代理设置");
     putStr("notify_tg_proxy", tg["proxy"]);
     if (tg["token"]) updates["notify_tg_token"] = String(tg["token"]);
   }
@@ -1492,7 +1499,7 @@ app.post("/api/v1/settings", async (c) => {
     if (newUsername.length < 3) throw invalid("用户名至少 3 个字符");
     if (newUsername !== (await repo.getSetting(env, "admin_username"))) {
       updates["admin_username"] = newUsername;
-      bumpedEpoch = Math.floor(Date.now() / 1000);
+      bumpedEpoch = Math.max(Math.floor(Date.now() / 1000), (await sessionEpoch(c.env)) + 1);
       updates["session_epoch"] = String(bumpedEpoch);
       newSessionUser = newUsername;
     }
@@ -1500,7 +1507,7 @@ app.post("/api/v1/settings", async (c) => {
   if (newPassword !== null && newPassword !== undefined && newPassword !== "") {
     if (String(newPassword).length < 10) throw invalid("新密码至少 10 个字符");
     updates["admin_password"] = await security.hashPassword(String(newPassword));
-    bumpedEpoch = Math.floor(Date.now() / 1000);
+    bumpedEpoch = Math.max(Math.floor(Date.now() / 1000), (await sessionEpoch(c.env)) + 1);
     updates["session_epoch"] = String(bumpedEpoch);
   }
 
@@ -1510,9 +1517,10 @@ app.post("/api/v1/settings", async (c) => {
       .filter(([key, value]) => String(before[key] ?? "") !== String(value))
       .map(([key]) => key)
       .filter((key) => !SETTING_LABELS_SKIP.has(key));
-    await repo.setSettings(env, updates);
-    if ("ddns_records" in updates) {
-      await dns.syncRegistry(env, await repo.getSettings(env));
+    const actualUpdates = Object.fromEntries(Object.entries(updates).filter(([key, value]) => before[key] !== value));
+    await repo.setSettings(env, actualUpdates, changed.some(key => key.startsWith("ddns_")));
+    if ("ddns_records" in actualUpdates) {
+      await dns.syncRegistry(env, { ...before, ...actualUpdates });
     }
     if (changed.length) {
       await repo.addEvent(env, "system", messages.ev("配置已更新"), {

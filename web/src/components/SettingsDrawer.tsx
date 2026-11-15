@@ -73,8 +73,6 @@ export default function SettingsDrawer({ settings, onClose, onSaved }: Props) {
       await post('/api/v1/settings', {
         timezone: form.timezone,
         traffic_threshold_pct: Number(form.traffic_threshold_pct),
-        reconcile_interval: Number(form.reconcile_interval),
-        reconcile_offset: Number(form.reconcile_offset),
         billing_enabled: form.billing_enabled,
         billing_interval: Number(form.billing_interval),
         daily_report_enabled: form.daily_report_enabled,
@@ -101,7 +99,7 @@ export default function SettingsDrawer({ settings, onClose, onSaved }: Props) {
           enabled: form.telegram.enabled,
           token: (form.telegram as unknown as { token?: string }).token || '',
           chat_id: form.telegram.chat_id,
-          proxy: form.telegram.proxy,
+          proxy: '',
         },
         email: {
           enabled: form.email.enabled,
@@ -234,36 +232,12 @@ export default function SettingsDrawer({ settings, onClose, onSaved }: Props) {
               </div>
               <div className="grid-2">
                 <div className="field">
-                  <label htmlFor="interval">巡检间隔（秒）</label>
-                  <input
-                    id="interval"
-                    className="input"
-                    type="number"
-                    min={30}
-                    max={3600}
-                    value={form.reconcile_interval}
-                    onChange={(event) =>
-                      patch((draft) => (draft.reconcile_interval = event.target.value))
-                    }
-                  />
-                  <div className="hint">流量 / 状态 / 保活的查询间隔，默认 60 秒。</div>
+                  <label>后台巡检</label>
+                  <div className="hint">每 5 分钟检查流量、状态和保活；可在概览点击「立即同步」。自动恢复和超限停机可能延后约 5 分钟，开停机完成确认还需后续巡检。</div>
                 </div>
                 <div className="field">
-                  <label htmlFor="offset">巡检起始秒（0–59）</label>
-                  <input
-                    id="offset"
-                    className="input"
-                    type="number"
-                    min={0}
-                    max={59}
-                    value={form.reconcile_offset}
-                    onChange={(event) =>
-                      patch((draft) => (draft.reconcile_offset = event.target.value))
-                    }
-                  />
-                  <div className="hint">
-                    每轮巡检从这一秒开始，默认 0；多台实例串行查询，设一次即可，也可用于错开其他项目。
-                  </div>
+                  <label>页面刷新</label>
+                  <div className="hint">可见时每 60 秒刷新，切到后台或最小化时暂停；返回页面或完成操作后立即刷新。</div>
                 </div>
                 <div className="field">
                   <label htmlFor="tz">
@@ -296,7 +270,7 @@ export default function SettingsDrawer({ settings, onClose, onSaved }: Props) {
                       patch((draft) => (draft.billing_interval = event.target.value))
                     }
                   />
-                  <div className="hint">账单 / 余额是慢数据，默认 600（10 分钟）。</div>
+                  <div className="hint">默认 21600 秒（6 小时），可在服务器卡片手动刷新费用。</div>
                 </div>
               </div>
 
@@ -554,18 +528,7 @@ export default function SettingsDrawer({ settings, onClose, onSaved }: Props) {
                       />
                     </div>
                   </div>
-                  <div className="field">
-                    <label htmlFor="tgproxy">代理（可选）</label>
-                    <input
-                      id="tgproxy"
-                      className="input"
-                      value={form.telegram.proxy}
-                      onChange={(event) =>
-                        patch((draft) => (draft.telegram.proxy = event.target.value))
-                      }
-                      placeholder="http://127.0.0.1:7890 或 socks5h://127.0.0.1:1080"
-                    />
-                  </div>
+                  <div className="hint">Telegram 由 Cloudflare 直接发送，不支持本机 HTTP / SOCKS 代理。</div>
                   <div className="test-row">
                     <button
                       className="btn"

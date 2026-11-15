@@ -1,5 +1,6 @@
 import type { Env } from "./env";
-import { app } from "./api";
+import { app, mutationGuard } from "./api";
+import { bufferMutation } from "./request-body";
 import { runReconcile } from "./scheduler";
 
 /**
@@ -23,6 +24,19 @@ export class ControlPlane {
     }
     if (!scheduled && (request.method === "GET" || request.method === "HEAD")) {
       return app.fetch(request, this.env);
+    }
+    if (!scheduled) {
+      // Refuse unauthorised writes before accepting a potentially slow body.
+      // Handlers re-check credentials inside the queue, after earlier changes.
+      if (path !== "/api/v1/auth/login" && path !== "/api/v1/setup") {
+        const guard = await mutationGuard.fetch(request, this.env);
+        if (!guard.ok) return guard;
+      }
+      const buffered = await bufferMutation(request);
+      if (buffered instanceof Response) return buffered;
+      request = buffered;
+      // Login already uses atomic D1 rate limiting and mutates no cloud state.
+      if (path === "/api/v1/auth/login") return app.fetch(request, this.env);
     }
     // Cron ticks do not build a backlog while a manual operation is in flight.
     if (scheduled && this.pending > 0) return new Response(null, { status: 202 });

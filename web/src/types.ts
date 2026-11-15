@@ -92,7 +92,7 @@ export type Keepalive = {
   server_id: number
   enabled: boolean
   created_at: number
-  /** 每天允许运行的时段（HH:MM，不跨零点）；空串 = 全天 */
+  /** 每天允许运行的时段（HH:MM，可跨零点；起止相同为全天）；空串 = 全天 */
   start_time: string
   end_time: string
   /** 每月允许运行的日子（1–31，不跨月）；0 = 全月 */

@@ -1,39 +1,7 @@
-/**
- * Scheduler — TypeScript port of `app/scheduler.py` `_loop` body.
- *
- * One `runReconcile(env)` call is one reconcile round; it is invoked by
- * the Workers Cron Trigger (every minute, see wrangler.toml) and by
- * `scheduled()` in `index.ts`.
- *
- * DEGRADATIONS vs the Python original (deliberate — Workers has no
- * long-lived threads):
- * - No 5-second event-confirm thread (`_confirm_loop` /
- *   `_confirm_pending_events`). A manual start/stop (or any event waiting
- *   for an instance state) is only confirmed on the next reconcile step,
- *   i.e. on the next 1-minute cron tick, instead of within ~5 seconds.
- *   Confirmation logic lives in `shift.ts` (`confirmPendingManualEvents`,
- *   called from `reconcileAll`); a 10-minute timeout bounds the wait so a
- *   stuck event can never block later manual start/stop calls.
- * - No fast-reconcile window (`request_fast_reconcile`, 10 s interval for
- *   90 s after a group is created). The cron interval is fixed at 1
- *   minute; the API's group-save handler still bootstraps a new group
- *   synchronously, so the "save and see members settle" behaviour is
- *   preserved for that path. Use POST /api/v1/reconcile for an on-demand
- *   round instead of waiting for the next tick.
- * - No grid alignment to `reconcile_offset`: Workers Cron Triggers fire
- *   at minute boundaries, so the configured "巡检起始秒" offset is
- *   effectively ignored. The `reconcile_interval` setting is likewise
- *   not honoured by the trigger (minimum cron cadence is 1 minute);
- *   `CDT_RECONCILE_INTERVAL` only matters if a future driver re-implements
- *   the wait loop.
- * - No wake-up signal (`_wake`): on-demand rounds go through the API.
- * - Daily-report dedup and the hourly prune timestamp are kept in D1
- *   flags (`daily_report:<date>` is checked inside `engine.dailyReport`;
- *   `scheduler_last_prune` here) instead of module globals, because a
- *   Workers isolate may be recycled between ticks and globals do not
- *   survive across isolates.
+/** Five-minute Cron; on-demand operations keep their immediate execution path.
+ * One settings snapshot is shared by the round. Daily reports use the collected
+ * state, and billing has an independent six-hour cache.
  */
-
 import type { Env } from "./env";
 import * as repo from "./repo";
 import * as dns from "./dns";
@@ -65,33 +33,32 @@ function tzParts(tzName: string, at: Date): { hour: number; minute: number; date
   };
 }
 
-async function maybeDailyReport(env: Env): Promise<void> {
-  const config = await repo.getSettings(env);
+async function maybeDailyReport(env: Env, config: Record<string, string>): Promise<void> {
   if (config["daily_report_enabled"] !== "1") return;
-  if ((await repo.getSetting(env, "initialized")) !== "1") return;
+  if (config.initialized !== "1") return;
 
   const tzName = config["timezone"] || "Asia/Shanghai";
   const now = new Date();
-  const { hour, minute } = tzParts(tzName, now);
+  const { hour, minute, dateStr } = tzParts(tzName, now);
   const target = config["daily_report_time"] || "23:58";
   const [targetHour, targetMinute] = target.split(":").map((v) => Number(v) || 0);
-  // "Has the target time passed today?" — not "is it exactly this minute",
-  // so a restart at 23:59 still delivers the report (same as Python).
-  if (hour * 60 + minute < (targetHour ?? 23) * 60 + (targetMinute ?? 58)) return;
-  // dailyReport() itself dedupes via the `daily_report:<date>` flag in D1,
-  // so calling it every minute after the target time is a cheap no-op.
-  await dailyReport(env);
+  // Select the most recent due daily slot. A 23:58 report is delivered at
+  // 00:00, keyed to the previous date, instead of being missed every day.
+  const pastTarget = hour * 60 + minute >= (targetHour ?? 23) * 60 + (targetMinute ?? 58);
+  const previousDate = new Date(Date.parse(`${dateStr}T12:00:00Z`) - 86400_000).toISOString().slice(0, 10);
+  await dailyReport(env, config, false, pastTarget ? dateStr : previousDate);
 }
 
 export async function runReconcile(env: Env): Promise<void> {
+  const config = await repo.getSettings(env);
   try {
-    await reconcileAll(env);
+    await reconcileAll(env, config);
   } catch (e) {
     console.error("reconcile round failed", e);
   }
 
   try {
-    await maybeDailyReport(env);
+    await maybeDailyReport(env, config);
   } catch (e) {
     console.error("daily report check failed", e);
   }
@@ -99,15 +66,15 @@ export async function runReconcile(env: Env): Promise<void> {
   // DNS: only issues real requests when a target is running but its
   // resolution disagrees; steady state costs nothing.
   try {
-    await dns.reconcile(env, await repo.getSettings(env));
+    await dns.reconcile(env, config);
   } catch (e) {
     console.error("DNS reconcile failed", e);
   }
 
-  // Billing is slow data; refreshDue() applies its own ~30 min TTL and
+  // Billing is slow data; refreshDue() applies its own six-hour TTL and
   // only calls out when a snapshot is actually due.
   try {
-    await billing.refreshDue(env);
+    await billing.refreshDue(env, undefined, config);
   } catch (e) {
     console.error("billing refresh failed", e);
   }

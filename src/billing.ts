@@ -35,7 +35,7 @@ import { ev, objServer } from "./messages";
 
 // Billing refresh interval default (seconds); the real value comes from the
 // `billing_interval` setting. Python: DEFAULT_BILL_TTL = 10 * 60.
-export const DEFAULT_BILL_TTL = 10 * 60;
+export const DEFAULT_BILL_TTL = 6 * 3600;
 
 export interface BillingSnapshot {
   monthly_cost: number | null;
@@ -110,10 +110,10 @@ function toAccount(server: ServerView): AliyunAccount {
 export async function refreshServer(
   env: Env,
   serverId: number,
-  options?: { force?: boolean },
+  options?: { force?: boolean; config?: Record<string, string> },
 ): Promise<BillingSnapshot | null> {
   const force = options?.force ?? false;
-  const config = await getSettings(env);
+  const config = options?.config ?? await getSettings(env);
   if (!enabled(config)) return null;
 
   const server = await getServer(env, serverId, true);
@@ -175,8 +175,8 @@ export async function refreshServer(
  * actually refreshed. Never throws — a billing failure must not kill the
  * scheduler loop.
  */
-export async function refreshDue(env: Env, nowTs?: number): Promise<number> {
-  const config = await getSettings(env);
+export async function refreshDue(env: Env, nowTs?: number, suppliedConfig?: Record<string, string>): Promise<number> {
+  const config = suppliedConfig ?? await getSettings(env);
   if (!enabled(config)) return 0;
 
   const now = nowTs ?? Date.now() / 1000;
@@ -192,7 +192,7 @@ export async function refreshDue(env: Env, nowTs?: number): Promise<number> {
     // account is not hammered every 60s.
     if (last && now - last < ttl && (cycle === "" || cycle === currentCycleName)) continue;
     try {
-      if ((await refreshServer(env, server.id)) !== null) refreshed += 1;
+      if ((await refreshServer(env, server.id, { config })) !== null) refreshed += 1;
     } catch {
       // Swallowed on purpose (mirrors Python's log.exception + continue).
     }

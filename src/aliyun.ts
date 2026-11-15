@@ -27,7 +27,7 @@ import type { Env } from "./env";
 import { listServers } from "./repo";
 
 export class AliyunError extends Error {
-  constructor(message: string) {
+  constructor(message: string, public kind = "") {
     super(message);
     this.name = "AliyunError";
   }
@@ -128,6 +128,14 @@ const AUTH_ERROR_HINTS = [
   "accessdenied",
 ];
 const THROTTLE_HINTS = ["throttling", "requestlimitexceeded", "serviceunavailable"];
+
+export function classifyError(exc: unknown): string {
+  if (exc instanceof AliyunError && exc.kind) return exc.kind;
+  const text = `${(exc as { code?: string })?.code ?? ""} ${exc instanceof Error ? exc.message : String(exc)}`.toLowerCase();
+  if (AUTH_ERROR_HINTS.some(h => text.includes(h))) return "auth";
+  if (THROTTLE_HINTS.some(h => text.includes(h))) return "throttle";
+  return "other";
+}
 
 const SECRET_PARAM_RE =
   /\b(Signature|AccessKeyId|AccessKeySecret|SecurityToken|SignatureNonce)=([^&\s'"]+)/gi;
@@ -401,34 +409,34 @@ export async function getInstanceBill(
       site: account.site || "china",
     };
   }
-  let data: Record<string, unknown>;
-  let site: string;
-  try {
-    ({ data, site } = await bssWithSiteFallback(account, "DescribeInstanceBill", {
-      BillingCycle: cycle,
-      InstanceID: account.instance_id,
-      Granularity: "MONTHLY",
-      MaxResults: "300",
-    }));
-  } catch (exc) {
-    throw new AliyunError(`实例账单查询失败：${briefError(exc)}`);
-  }
-  const dataObj = (data["Data"] as Record<string, unknown> | undefined) ?? {};
-  let items: unknown = dataObj["Items"] ?? [];
-  // Some responses wrap the array as {"Item": [...]}.
-  if (items !== null && typeof items === "object" && !Array.isArray(items)) {
-    items = (items as Record<string, unknown>)["Item"] ?? [];
-  }
+  let site = account.site || "china";
+  let token = "";
   let total = 0;
-  if (Array.isArray(items)) {
-    for (const item of items) {
-      if (item === null || typeof item !== "object") continue;
-      const v = (item as Record<string, unknown>)["PretaxAmount"];
-      const n = typeof v === "number" ? v : parseFloat(String(v ?? "0"));
-      if (Number.isFinite(n)) total += n;
+  const seen = new Set<string>();
+  for (let page = 0; page < 100; page++) {
+    let data: Record<string, unknown>;
+    try {
+      ({ data, site } = await bssWithSiteFallback({ ...account, site }, "DescribeInstanceBill", {
+        BillingCycle: cycle, InstanceID: account.instance_id,
+        Granularity: "MONTHLY", MaxResults: "300", ...(token ? { NextToken: token } : {}),
+      }));
+    } catch (exc) {
+      throw new AliyunError(`实例账单查询失败：${briefError(exc)}`);
     }
+    const payload = (data.Data as Record<string, unknown> | undefined) ?? {};
+    let items: unknown = payload.Items ?? [];
+    if (items && typeof items === "object" && !Array.isArray(items)) items = (items as Record<string, unknown>).Item ?? [];
+    if (Array.isArray(items)) for (const item of items) {
+      if (!item || typeof item !== "object") continue;
+      const amount = Number(item.PretaxAmount ?? 0);
+      if (Number.isFinite(amount)) total += amount;
+    }
+    token = String(payload.NextToken ?? "");
+    if (!token) return { total: Math.round(total * 100) / 100, site };
+    if (seen.has(token)) throw new AliyunError("账单分页标记重复，无法确认完整金额");
+    seen.add(token);
   }
-  return { total: Math.round(total * 100) / 100, site };
+  throw new AliyunError("账单页数超出限制，未显示不完整金额");
 }
 
 // ---------------------------------------------------------------------------
@@ -584,7 +592,7 @@ export async function startInstance(env: Env, account: AliyunAccount): Promise<v
       const code = errorCode(exc) || "InsufficientInventory";
       throw new AliyunError(`库存不足（${code}），${account.region_id || "该地域"} 暂无可用实例库存`);
     }
-    throw new AliyunError(`启动实例失败：${briefError(exc)}`);
+    throw new AliyunError(`启动实例失败：${briefError(exc)}`, classifyError(exc));
   }
 }
 

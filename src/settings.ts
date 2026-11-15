@@ -18,14 +18,14 @@ export const UPSTREAM_REPO = "BeacherZ/cdt-management";
 
 // Reconcile interval (seconds). Below 30s would exhaust the Aliyun API quota.
 export const RECONCILE_INTERVAL_MIN_SECONDS = 30;
-export const RECONCILE_INTERVAL_DEFAULT_SECONDS = 60;
+export const RECONCILE_INTERVAL_DEFAULT_SECONDS = 300;
 
 // Single Aliyun / HTTP call timeout (seconds).
 export const HTTP_TIMEOUT_SECONDS = 12;
 
 // Events are retained this many days (pruneEvents).
 export const EVENT_RETAIN_DAYS_MIN = 1;
-export const EVENT_RETAIN_DAYS_DEFAULT = 14;
+export const EVENT_RETAIN_DAYS_DEFAULT = 7;
 
 // Shift timeout (minutes): a handover not ready by then is a shift failure.
 export const SHIFT_TIMEOUT_MINUTES_MIN = 2;
@@ -81,7 +81,7 @@ export const SESSION_TTL_SECONDS = 14 * 24 * 3600;
 /**
  * Default rows for the D1 `settings` table, mirroring db.py DEFAULTS.
  * The migration seeds these; `reconcile_interval` defaults to the
- * RECONCILE_INTERVAL default (60). Values are strings, as in Python.
+ * RECONCILE_INTERVAL default (300). Values are strings, as in Python.
  */
 export const DEFAULT_SETTINGS: Record<string, string> = {
   admin_username: "",
@@ -95,7 +95,7 @@ export const DEFAULT_SETTINGS: Record<string, string> = {
   // Which second of each N-second grid a reconcile round fires on (0–59).
   reconcile_offset: "0",
   billing_enabled: "1",
-  billing_interval: "600",
+  billing_interval: "21600",
   daily_report_enabled: "1",
   daily_report_time: "23:58",
   notify_on_shift: "1",

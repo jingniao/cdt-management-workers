@@ -71,6 +71,18 @@ export function isHhmm(value: string): boolean {
 
 export type SettingsMap = Record<string, string>;
 
+/** Credentials and their revision must come from the same database snapshot. */
+export async function getAdminCredentials(env: Env): Promise<{ username: string; passwordHash: string; epoch: number }> {
+  const rows = await query<Row>(env.DB,
+    "SELECT key, value FROM settings WHERE key IN ('admin_username','admin_password','session_epoch')");
+  const values = Object.fromEntries(rows.map(row => [asStr(row.key), asStr(row.value)]));
+  return {
+    username: values.admin_username ?? "",
+    passwordHash: values.admin_password ? await decrypt(values.admin_password, env.ENCRYPTION_KEY) : "",
+    epoch: asInt(values.session_epoch),
+  };
+}
+
 export async function getSettings(env: Env): Promise<SettingsMap> {
   const rows = await query<Row>(env.DB, "SELECT key, value FROM settings");
   const data: SettingsMap = {};
@@ -114,6 +126,7 @@ export async function getSetting(
 export async function setSettings(
   env: Env,
   values: SettingsMap,
+  invalidateDns = false,
 ): Promise<void> {
   const statements = [];
   for (const [key, value] of Object.entries(values)) {
@@ -127,6 +140,11 @@ export async function setSettings(
       params: [key, stored] as (string | number | null)[],
     });
   }
+  if (invalidateDns) statements.push(
+    { sql: "UPDATE dns_records SET last_status='', last_at=0 WHERE last_status<>'' OR last_at<>0", params: [] },
+    { sql: "DELETE FROM flags WHERE key LIKE 'dns_retry:%' OR key LIKE 'dns_fail:%'", params: [] },
+    { sql: "UPDATE settings SET value='' WHERE key='ddns_last_status' AND value<>''", params: [] },
+  );
   if (statements.length > 0) await batch(env.DB, statements);
 }
 
@@ -657,50 +675,21 @@ export async function updateServerRuntime(
   opts: RuntimeUpdate,
 ): Promise<void> {
   const now = nowSeconds();
+  const sets: string[] = [];
+  const values: (string | number)[] = [];
+  const put = (column: string, value: string | number) => { sets.push(`${column}=?`); values.push(value); };
   if (opts.traffic !== null && opts.traffic !== undefined) {
-    await execute(
-      env.DB,
-      "UPDATE servers SET traffic_used=?, traffic_checked_at=? WHERE id=?",
-      [Number(opts.traffic), now, serverId],
-    );
+    put("traffic_used", Number(opts.traffic)); put("traffic_checked_at", now);
   }
   if (opts.status !== null && opts.status !== undefined) {
     const status = String(opts.status);
-    const stoppedMode = String(opts.stoppedMode ?? "");
-    if (opts.publicIp) {
-      await execute(
-        env.DB,
-        "UPDATE servers SET instance_status=?, stopped_mode=?, public_ip=?, " +
-          "status_checked_at=? WHERE id=?",
-        [status, stoppedMode, String(opts.publicIp), now, serverId],
-      );
-    } else if (status.startsWith("Stop") || status.includes("Releas")) {
-      // Stopped / released: the public IP really is gone, clear it.
-      await execute(
-        env.DB,
-        "UPDATE servers SET instance_status=?, stopped_mode=?, public_ip='', " +
-          "status_checked_at=? WHERE id=?",
-        [status, stoppedMode, now, serverId],
-      );
-    } else {
-      // Running / starting but no public IP: usually a transient missing
-      // field in DescribeInstances. Keep the last known IP rather than
-      // blanking DNS targets and notification IP lines.
-      await execute(
-        env.DB,
-        "UPDATE servers SET instance_status=?, stopped_mode=?, " +
-          "status_checked_at=? WHERE id=?",
-        [status, stoppedMode, now, serverId],
-      );
-    }
+    put("instance_status", status); put("stopped_mode", String(opts.stoppedMode ?? ""));
+    put("status_checked_at", now);
+    if (opts.publicIp) put("public_ip", String(opts.publicIp));
+    else if (status.startsWith("Stop") || status.includes("Releas")) put("public_ip", "");
   }
-  if (opts.regionId) {
-    // Backfill the real region from DescribeInstances; never trust a typo.
-    await execute(env.DB, "UPDATE servers SET region_id=? WHERE id=?", [
-      String(opts.regionId),
-      serverId,
-    ]);
-  }
+  if (opts.regionId) put("region_id", String(opts.regionId));
+  if (sets.length) await execute(env.DB, `UPDATE servers SET ${sets.join(", ")} WHERE id=?`, [...values, serverId]);
 }
 
 // ---------------------------------------------------------------------------
@@ -722,12 +711,13 @@ export async function addSample(
   const now = nowSeconds();
   const last = await queryOne<Row>(
     env.DB,
-    "SELECT used, ts FROM traffic_samples WHERE server_id=? ORDER BY ts DESC LIMIT 1",
+    "SELECT used, ts, status FROM traffic_samples WHERE server_id=? ORDER BY ts DESC LIMIT 1",
     [serverId],
   );
   if (
     last !== null &&
     now - asInt(last["ts"]) < 600 &&
+    asStr(last["status"]) === status &&
     Math.abs(asNum(last["used"]) - used) < 0.001
   ) {
     return;
@@ -778,7 +768,7 @@ export async function latestSamples(
 ): Promise<{ used: number; ts: number } | null> {
   const row = await queryOne<Row>(
     env.DB,
-    "SELECT used, ts FROM traffic_samples WHERE server_id=? ORDER BY ts DESC LIMIT 1",
+    "SELECT used, ts, status FROM traffic_samples WHERE server_id=? ORDER BY ts DESC LIMIT 1",
     [serverId],
   );
   return row ? { used: asNum(row["used"]), ts: asInt(row["ts"]) } : null;
@@ -1666,6 +1656,7 @@ export interface ShiftRun {
   started_at: number;
   updated_at: number;
   note: string;
+  settled_event_id: number;
 }
 
 function toShiftRun(row: Row): ShiftRun {
@@ -1688,6 +1679,7 @@ function toShiftRun(row: Row): ShiftRun {
     started_at: asInt(row["started_at"]),
     updated_at: asInt(row["updated_at"]),
     note: asStr(row["note"]),
+    settled_event_id: asInt(row["settled_event_id"]),
   };
 }
 
@@ -1726,6 +1718,7 @@ const RUN_COLUMNS: ReadonlySet<string> = new Set([
   "started_at",
   "updated_at",
   "note",
+  "settled_event_id",
 ]);
 
 export async function upsertRun(
@@ -2216,5 +2209,5 @@ export async function pruneEvents(env: Env, days: number): Promise<void> {
   await execute(env.DB, "DELETE FROM shift_runs WHERE updated_at<?", [
     now - 30 * 86400,
   ]);
-  await execute(env.DB, "DELETE FROM traffic_samples WHERE ts<?", [now - 7 * 86400]);
+  await execute(env.DB, "DELETE FROM traffic_samples WHERE ts<?", [now - 3 * 86400]);
 }

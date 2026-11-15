@@ -20,11 +20,11 @@ class_name = "ControlPlane"
 tag = "v1-control-plane"
 new_sqlite_classes = ["ControlPlane"]
 
-# Reconcile loop: once per minute (Workers Cron Triggers cannot run faster).
+# Economy schedule: once every five minutes.
 # Deliberate degradation vs the original: no 5-second event-confirm thread,
 # no 10-second fast-reconcile window — use POST /api/v1/reconcile instead.
 [triggers]
-crons = ["*/1 * * * *"]
+crons = ["*/5 * * * *"]
 
 [assets]
 directory = "./web/dist"
@@ -33,8 +33,8 @@ run_worker_first = ["/api", "/api/*"]
 not_found_handling = "single-page-application"
 
 [vars]
-CDT_RECONCILE_INTERVAL = "60"
+CDT_RECONCILE_INTERVAL = "300"
 CDT_SHIFT_TIMEOUT_MINUTES = "10"
 CDT_DUTY_START_TRIES = "3"
 CDT_DUTY_STALL_SECONDS = "180"
-CDT_EVENT_RETAIN_DAYS = "14"
+CDT_EVENT_RETAIN_DAYS = "7"

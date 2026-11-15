@@ -11,7 +11,8 @@ function endLabel(start: string, end: string): string {
 export function windowSummary(item: Window): string {
   const parts: string[] = []
   if (item.start_time && item.end_time) {
-    parts.push(`每天 ${item.start_time}–${endLabel(item.start_time, item.end_time)}`)
+    const end = endLabel(item.start_time, item.end_time)
+    parts.push(item.start_time === item.end_time ? '每天全天' : `每天 ${item.start_time}–${end < item.start_time ? '次日 ' : ''}${end}`)
   }
   if (item.start_day && item.end_day) parts.push(`每月 ${item.start_day}–${item.end_day} 日`)
   return parts.join(' · ')

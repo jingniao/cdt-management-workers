@@ -232,7 +232,7 @@ async function findRecord(
   headers: Record<string, string>,
   zoneId: string,
   record: string,
-): Promise<[string, string] | null> {
+): Promise<[string, string, number, boolean] | null> {
   const url =
     `${API}/zones/${zoneId}/dns_records` +
     `?name=${encodeURIComponent(record)}&type=A`;
@@ -246,11 +246,11 @@ async function findRecord(
   }
   const payload = (await response.json().catch(() => ({}))) as {
     success?: boolean;
-    result?: Array<{ id: string; content?: string }>;
+    result?: Array<{ id: string; content?: string; ttl?: number; proxied?: boolean }>;
   };
   if (payload.success && payload.result && payload.result.length > 0) {
-    const item = payload.result[0] as { id: string; content?: string };
-    return [String(item.id), String(item.content ?? "")];
+    const item = payload.result[0] as { id: string; content?: string; ttl?: number; proxied?: boolean };
+    return [String(item.id), String(item.content ?? ""), Number(item.ttl ?? 0), item.proxied === true];
   }
   return null;
 }
@@ -344,11 +344,13 @@ export async function syncFull(
         }
         continue;
       }
-      const [recordId, current] = found;
+      const [recordId, current, currentTtl, currentProxied] = found;
+      const desiredProxied = config["ddns_proxied"] === "1";
+      const desiredTtl = desiredProxied ? 1 : Number(config["ddns_ttl"] ?? 60) || 60;
 
       // 关键时刻已核对过真实值：CF 上就是这台机器的 IP，再 PUT 一遍只会
       // 白白刷新记录的修改时间，事件里还得写「已更新」，属于谎报。
-      if (verify && !force && current === ip) {
+      if (verify && !force && current === ip && currentProxied === desiredProxied && (desiredProxied || currentTtl === desiredTtl)) {
         console.info(`DDNS 已是最新 ${name} -> ${ip}，跳过更新`);
         return new DDNSResult(STATUS_UNCHANGED, "IP 未变化", false, ip, current);
       }
@@ -360,8 +362,8 @@ export async function syncFull(
           type: "A",
           name,
           content: ip,
-          ttl: Number(config["ddns_ttl"] ?? 60) || 60,
-          proxied: config["ddns_proxied"] === "1",
+          ttl: desiredTtl,
+          proxied: desiredProxied,
         }),
         signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
       });

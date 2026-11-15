@@ -1,7 +1,6 @@
 import { useState } from 'react'
 import { HeartPulse, TriangleAlert } from 'lucide-react'
 import { post } from '../api'
-import { minutesOf } from '../keepalive'
 import type { Keepalive, Server } from '../types'
 import { Modal, Segmented, Switch } from './ui'
 
@@ -53,13 +52,6 @@ export default function KeepaliveDialog({ server, item, onClose, onSaved }: Prop
     if (timeMode === 'custom') {
       if (!startTime || !endTime) {
         setError('运行时段要填完整的起止时刻，或者切回「不限」')
-        return
-      }
-      // 结束填 00:00 = 到当天午夜（与联合换班一致）；其余仍要求结束晚于开始
-      const endMinutes =
-        endTime === '00:00' && minutesOf(startTime) > 0 ? 24 * 60 : minutesOf(endTime)
-      if (endMinutes <= minutesOf(startTime)) {
-        setError('结束时刻要晚于开始时刻（不支持跨零点；结束填 00:00 表示到 24:00）')
         return
       }
       start_time = startTime
@@ -173,7 +165,7 @@ export default function KeepaliveDialog({ server, item, onClose, onSaved }: Prop
           </div>
         )}
         <div className="hint">
-          每天在这个时间段内运行；不接受跨零点，结束填 00:00 表示到 24:00，要跑一整天就用「不限」。
+          支持跨午夜，例如 20:00–06:00；起止相同表示全天。日期范围按当前日期判断，窗口边界在下一轮巡检执行。
         </div>
       </div>
 
